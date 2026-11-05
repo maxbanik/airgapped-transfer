@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Airgapped QR Transfer</title>
+<style>
+  :root { --bg:#f6f6f4; --fg:#1c1c1c; --muted:#666; --line:#d6d6d2; --accent:#1f5fbf; --card:#fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141414; --fg:#ececec; --muted:#9a9a9a; --line:#353535; --accent:#6aa0ff; --card:#1f1f1f; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, system-ui, "Segoe UI", sans-serif; }
+  main { max-width:680px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  p.lead { color:var(--muted); margin:0 0 20px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { font-size:16px; margin:0 0 6px; }
+  .card p { margin:0 0 12px; color:var(--muted); font-size:14px; }
+  a.btn { display:inline-block; padding:9px 16px; border-radius:8px; background:var(--accent); color:#fff; text-decoration:none; font-weight:600; }
+  a.btn.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  ol { padding-left:20px; } li { margin:6px 0; }
+  .small { font-size:13px; color:var(--muted); }
+  code { font-size:.9em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Airgapped QR Transfer</h1>
+  <p class="lead">Move files off an offline machine using only its screen and your phone's camera.</p>
+  <div class="cards">
+    <div class="card">
+      <h2>📱 Receiver (this device)</h2>
+      <p>Open on the phone or iPad. Shows which blocks arrived and which were missed.</p>
+      <a class="btn" href="receiver.html">Open receiver</a>
+    </div>
+    <div class="card">
+      <h2>🖥 Sender (offline machine)</h2>
+      <p>Single self-contained HTML file. Download it and copy it to the airgapped machine.</p>
+      <a class="btn secondary" href="sender.html" download>Download sender.html</a>
+    </div>
+  </div>
+  <h2 style="font-size:18px;margin-top:28px">How to use</h2>
+  <ol>
+    <li>On the offline machine open <code>sender.html</code> in any browser and pick a file.</li>
+    <li>On the phone open the receiver, tap <b>Start camera</b> and point it at the screen.</li>
+    <li>Press <b>Start</b> on the sender. It shows every block once, then switches to <b>repair codes</b>.</li>
+    <li>Each repair code can stand in for any one missed block — after about as many repair codes as blocks you missed, the receiver completes. Tap <b>Save file</b>.</li>
+    <li>Alternatively copy the receiver's “Missed blocks” list into the sender's <b>Resend only blocks</b> field.</li>
+  </ol>
+  <p class="small">Tuning: watch <i>Codes/s</i> on the receiver. If nothing is being missed, lower the sender's frame time or show 2–4 codes per frame. If many are missed, slow down or use a stand. The receiver works offline once loaded; received data never leaves the device. <a href="sender-classic.html" download>sender-classic.html</a> is the v1 sender for the original scanner.</p>
+</main>
+</body>
+</html>

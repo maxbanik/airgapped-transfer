@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:;" />
+<title>QR Sender v2</title>
+<!--
+  QR transfer v2 — offline sender. Single file, no network access (blocked by CSP).
+  Pair with receiver.html (v2). Not compatible with the original scanner; use
+  sender-classic.html for that.
+
+  Bundled third-party code (MIT):
+    - Nayuki QR Code generator v1.8.0 (transpiled from qrcodegen.ts)  __QRGEN_SRI__
+    - pako 2.0.3 pako_deflate.min.js  cdnjs SRI __PAKO_SRI__
+-->
+<style>
+  :root { --bg:#f6f6f4; --fg:#1c1c1c; --muted:#6a6a6a; --line:#d6d6d2; --accent:#1f5fbf; --card:#fff; --warn:#a33; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161616; --fg:#ececec; --muted:#9a9a9a; --line:#3a3a3a; --accent:#6aa0ff; --card:#202020; --warn:#f88; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { display:flex; flex-direction:column; height:100%; padding:10px 16px; gap:8px; }
+  .bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+  .bar h1 { font-size:15px; margin:0 6px 0 0; font-weight:600; }
+  label { display:inline-flex; align-items:center; gap:6px; color:var(--muted); }
+  input[type=number], input[type=text], select { padding:4px 6px; border:1px solid var(--line); border-radius:4px; background:var(--bg); color:var(--fg); font:inherit; }
+  input[type=number] { width:70px; }
+  input[type=file] { max-width:240px; color:var(--fg); }
+  button { font:inherit; padding:5px 13px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  .status { display:flex; flex-wrap:wrap; gap:4px 16px; align-items:center; min-height:22px; }
+  .status .msg { font-weight:600; }
+  .status .meta { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .status .err { color:var(--warn); }
+  progress { width:160px; height:8px; }
+  .stage { flex:1; display:grid; justify-content:center; align-content:center; gap:0; min-height:0; background:#fff; border-radius:6px; overflow:hidden; }
+  .stage canvas { display:block; image-rendering:pixelated; }
+  .resend { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .resend input { width:min(420px, 60vw); }
+  .drop { outline:3px dashed var(--accent); outline-offset:-6px; }
+</style>
+</head>
+<body>
+<div class="wrap" id="wrap">
+  <div class="bar">
+    <h1>QR Sender v2</h1>
+    <input type="file" id="file" />
+    <label title="How long each screen of codes is shown">Frame ms <input type="number" id="delay" value="150" min="50" max="5000" step="10" /></label>
+    <label title="QR codes shown side by side per frame. More = faster if the camera can resolve them.">Codes <select id="ncodes"><option>1</option><option>2</option><option>4</option></select></label>
+    <label title="Bytes of data per QR code. Larger = fewer but denser codes.">Chunk B <input type="number" id="chunk" value="400" min="50" max="__MAXCHUNK__" step="10" /></label>
+    <label title="QR error correction. L = most data, Q = most robust.">ECC <select id="ecc"><option value="LOW">L</option><option value="MEDIUM" selected>M</option><option value="QUARTILE">Q</option></select></label>
+    <label title="How long the header is shown before data starts">Header s <input type="number" id="hdr" value="2" min="0" max="30" step="1" /></label>
+    <button id="start">Start</button>
+    <button id="pause" class="secondary" disabled>Pause</button>
+    <button id="stop" class="secondary" disabled>Stop</button>
+  </div>
+  <div class="bar resend">
+    <label for="resend" title="Paste the missing list shown on the receiver. Leave empty to send automatic repair codes after the first pass.">Resend only blocks</label>
+    <input type="text" id="resend" placeholder="e.g. 12,45-48,97  (empty = automatic repair codes)" autocomplete="off" />
+    <button id="applyResend" class="secondary" disabled>Apply</button>
+    <button id="clearResend" class="secondary" disabled>Back to auto</button>
+  </div>
+  <div class="status">
+    <span class="msg" id="msg">Choose a file, open the receiver on the phone, then press Start.</span>
+    <progress id="prog" max="1" value="0" hidden></progress>
+    <span class="meta" id="meta"></span>
+  </div>
+  <div class="stage" id="stage"></div>
+</div>
+
+<script>
+__QRGEN_JS__
+</script>
+<script>
+__PAKO_JS__
+</script>
+<script>
+__PROTOCOL_JS__
+</script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var QR = qrcodegen.QrCode, SEG = qrcodegen.QrSegment;
+
+  var S = null;      // running session state
+  var wakeLock = null;
+
+  function fmtBytes(n) { return n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(2) + " MB"; }
+  function fmtTime(s) { s = Math.round(s); return s < 60 ? s + " s" : s < 3600 ? Math.floor(s / 60) + " min " + (s % 60) + " s" : (s / 3600).toFixed(1) + " h"; }
+
+  // ---------- rendering ----------
+  function layout(n) {
+    var st = $("stage"), r = st.getBoundingClientRect();
+    var cols = n === 1 ? 1 : n === 2 ? (r.width >= r.height ? 2 : 1) : 2;
+    var rows = Math.ceil(n / cols);
+    var side = Math.floor(Math.min(r.width / cols, r.height / rows));
+    st.innerHTML = "";
+    st.style.gridTemplateColumns = "repeat(" + cols + ", auto)";
+    var canvases = [];
+    for (var i = 0; i < n; i++) {
+      var c = document.createElement("canvas");
+      st.appendChild(c); canvases.push(c);
+    }
+    return { canvases: canvases, side: side };
+  }
+  function draw(canvas, side, text, ecc) {
+    var qr = QR.encodeSegments([SEG.makeAlphanumeric(text)], ecc, 1, 40, -1, false);
+    var dpr = window.devicePixelRatio || 1, px = Math.floor(side * dpr);
+    var total = qr.size + 8;                          // 4-module quiet zone each side
+    var mod = Math.max(1, Math.floor(px / total));    // integer pixels per module = crisp edges
+    var dim = mod * total;
+    if (canvas.width !== dim) { canvas.width = canvas.height = dim; }
+    canvas.style.width = canvas.style.height = (dim / dpr) + "px";
+    var ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, dim, dim);
+    ctx.fillStyle = "#000";
+    for (var y = 0; y < qr.size; y++) {
+      var run = -1;
+      for (var x = 0; x <= qr.size; x++) {
+        var dark = x < qr.size && qr.getModule(x, y);
+        if (dark && run < 0) run = x;
+        else if (!dark && run >= 0) { ctx.fillRect((run + 4) * mod, (y + 4) * mod, (x - run) * mod, mod); run = -1; }
+      }
+    }
+    return qr.version;
+  }
+  function idleScreen() {
+    var L = layout(1);
+    draw(L.canvases[0], Math.min(L.side, 320), "QR SENDER V2 - READY", qrcodegen.QrCode.Ecc.MEDIUM);
+  }
+
+  // ---------- frame sequence ----------
+  // header (meta) -> data 0..K-1 -> repair codes forever; meta interleaved every 20 frames.
+  // Or, with a resend list, cycle just those data blocks.
+  function nextText() {
+    S.count++;
+    if (S.count % 20 === 0) return { t: S.enc.metaFrame(), kind: "meta" };
+    if (S.resend) {
+      var i = S.resend[S.rpos++ % S.resend.length];
+      return { t: S.enc.dataFrame(i), kind: "resend", i: i };
+    }
+    if (S.pos < S.enc.K) { var j = S.pos++; return { t: S.enc.dataFrame(j), kind: "data", i: j }; }
+    return { t: S.enc.repairFrame(++S.seed), kind: "repair" };
+  }
+
+  function showFrame() {
+    var last, ver = 0;
+    for (var k = 0; k < S.L.canvases.length; k++) {
+      var f = S.headerUntil > performance.now() ? { t: S.metaText, kind: "meta" } : nextText();
+      ver = Math.max(ver, draw(S.L.canvases[k], S.L.side, f.t, S.ecc));
+      if (f.kind !== "meta") last = f;
+    }
+    S.version = ver;
+    updateStatus(last);
+  }
+
+  function updateStatus(f) {
+    var e = S.enc, perFrame = S.L.canvases.length;
+    var phase;
+    if (S.paused) phase = "Paused";
+    else if (S.headerUntil > performance.now()) phase = "Header — receiver should show the file name";
+    else if (S.resend) phase = "Resending " + S.resend.length + " block" + (S.resend.length > 1 ? "s" : "") + " (pass " + (Math.floor(S.rpos / S.resend.length) + 1) + ")";
+    else if (S.pos < e.K) phase = "Pass 1 · block " + (f && f.kind === "data" ? f.i + 1 : S.pos) + "/" + e.K;
+    else phase = "Repair codes · " + S.seed + " sent — keep going until the receiver says complete";
+    $("msg").textContent = phase;
+    $("prog").max = e.K; $("prog").value = Math.min(S.pos, e.K);
+    $("meta").textContent = S.info + " · QR v" + S.version + " · pass ≈ " + fmtTime(Math.ceil(e.K / perFrame) * S.delay / 1000);
+  }
+
+  function loop(now) {
+    if (!S || !S.running) return;
+    if (!S.paused && now >= S.nextAt) {
+      try { showFrame(); }
+      catch (err) { $("msg").innerHTML = '<span class="err"></span>'; $("msg").firstChild.textContent = "Error: " + err.message + " — try a smaller chunk or ECC L"; stop(true); return; }
+      S.nextAt = (now - S.nextAt > S.delay) ? now + S.delay : S.nextAt + S.delay;
+    }
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- controls ----------
+  function setRunning(on) {
+    $("start").disabled = on; $("stop").disabled = !on; $("pause").disabled = !on;
+    $("applyResend").disabled = !on; $("clearResend").disabled = !on;
+    ["file", "delay", "ncodes", "chunk", "ecc", "hdr"].forEach(function (id) { $(id).disabled = on; });
+    $("prog").hidden = !on;
+  }
+
+  async function start() {
+    var file = $("file").files[0];
+    if (!file) { $("msg").textContent = "Choose a file first."; return; }
+    var chunk = Math.min(+$("chunk").max, Math.max(50, Math.round(+$("chunk").value) || 400));
+    var delay = Math.max(50, +$("delay").value || 150);
+    var n = +$("ncodes").value || 1;
+    setRunning(true);
+    $("msg").textContent = "Reading and compressing " + fmtBytes(file.size) + "…";
+    await new Promise(function (r) { setTimeout(r, 30); });
+    var raw, stream, gz = 0;
+    try {
+      raw = new Uint8Array(await file.arrayBuffer());
+      var z = pako.gzip(raw, { level: 9 });
+      if (z.length < raw.length) { stream = z; gz = 1; } else stream = raw;
+    } catch (e) { $("msg").textContent = "Could not read/compress: " + e; setRunning(false); return; }
+    var enc = new QRT.Encoder(stream, chunk, { n: file.name, s: raw.length, c: QRT.crc32(raw), z: gz });
+    S = {
+      enc: enc, delay: delay, ecc: QR.Ecc[$("ecc").value], running: true, paused: false,
+      pos: 0, seed: 0, count: 0, resend: null, rpos: 0, version: 0,
+      metaText: enc.metaFrame(), L: layout(n),
+      headerUntil: performance.now() + Math.max(0, +$("hdr").value || 0) * 1000,
+      info: file.name + " · " + fmtBytes(raw.length) + (gz ? " → " + fmtBytes(stream.length) + " gzip" : " (not compressible)") + " · " + enc.K + " blocks (0–" + (enc.K - 1) + ")",
+    };
+    S.nextAt = performance.now();
+    applyResend(true);
+    try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+    requestAnimationFrame(loop);
+  }
+
+  function stop(keepMsg) {
+    if (S) S.running = false;
+    S = null; setRunning(false);
+    if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
+    if (keepMsg !== true) { $("msg").textContent = "Stopped."; $("meta").textContent = ""; }
+    idleScreen();
+  }
+
+  function applyResend(silent) {
+    if (!S) return;
+    var txt = $("resend").value.trim();
+    if (!txt) { S.resend = null; return; }
+    try {
+      var list = QRT.parseRanges(txt, S.enc.K);
+      if (!list.length) throw new Error("no valid block numbers (0–" + (S.enc.K - 1) + ")");
+      S.resend = list; S.rpos = 0;
+    } catch (e) { if (!silent) alert("Resend list: " + e.message); }
+  }
+
+  $("start").addEventListener("click", start);
+  $("stop").addEventListener("click", function () { stop(); });
+  $("pause").addEventListener("click", function () {
+    if (!S) return; S.paused = !S.paused; $("pause").textContent = S.paused ? "Resume" : "Pause";
+    if (!S.paused) S.nextAt = performance.now();
+    updateStatus();
+  });
+  $("applyResend").addEventListener("click", function () { applyResend(false); });
+  $("resend").addEventListener("keydown", function (e) { if (e.key === "Enter") applyResend(false); });
+  $("clearResend").addEventListener("click", function () { $("resend").value = ""; if (S) S.resend = null; });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && S) stop();
+    if (e.key === " " && S && document.activeElement.tagName !== "INPUT") { e.preventDefault(); $("pause").click(); }
+  });
+  document.addEventListener("visibilitychange", async function () {
+    if (S && document.visibilityState === "visible" && navigator.wakeLock) { try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {} }
+  });
+
+  var wrap = $("wrap");
+  wrap.addEventListener("dragover", function (e) { e.preventDefault(); wrap.classList.add("drop"); });
+  wrap.addEventListener("dragleave", function () { wrap.classList.remove("drop"); });
+  wrap.addEventListener("drop", function (e) {
+    e.preventDefault(); wrap.classList.remove("drop");
+    if (!S && e.dataTransfer.files.length) $("file").files = e.dataTransfer.files;
+  });
+  var rt; window.addEventListener("resize", function () {
+    clearTimeout(rt); rt = setTimeout(function () { if (S) S.L = layout(S.L.canvases.length); else idleScreen(); }, 150);
+  });
+  idleScreen();
+})();
+</script>
+</body>
+</html>

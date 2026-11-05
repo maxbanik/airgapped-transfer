@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:;" />
+<title>QR Sender (offline)</title>
+<!--
+  Offline sender for https://github.com/mohankumarelec/airgapped-qr-code-transfer
+  Fully self-contained: no network access needed (and blocked by the CSP above).
+  Wire format is identical to the original generator.html, so the hosted
+  scanner (https://airgapped-qr-code-transfer.mohanram.co.in/scanner) can receive.
+
+  Bundled third-party code (MIT):
+    - qrcodejs 1.0.0  (davidshimjs)  cdnjs SRI __QR_SRI__
+    - pako 2.0.3 pako_deflate.min.js (nodeca) cdnjs SRI __PAKO_SRI__
+-->
+<style>
+  :root { --bg:#f6f6f4; --fg:#1c1c1c; --muted:#6a6a6a; --line:#d6d6d2; --accent:#1f5fbf; --card:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161616; --fg:#ececec; --muted:#9a9a9a; --line:#3a3a3a; --accent:#6aa0ff; --card:#202020; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { display:flex; flex-direction:column; height:100%; padding:12px 16px; gap:10px; }
+  .bar { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .bar h1 { font-size:15px; margin:0 8px 0 0; font-weight:600; }
+  label { display:inline-flex; align-items:center; gap:6px; color:var(--muted); }
+  input[type=number] { width:72px; padding:4px 6px; border:1px solid var(--line); border-radius:4px; background:var(--bg); color:var(--fg); font:inherit; }
+  input[type=file] { max-width:260px; color:var(--fg); }
+  button { font:inherit; padding:6px 14px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  .status { display:flex; flex-wrap:wrap; gap:4px 16px; align-items:center; min-height:22px; }
+  .status .msg { font-weight:500; }
+  .status .meta { color:var(--muted); font-variant-numeric:tabular-nums; }
+  progress { width:180px; height:8px; }
+  .stage { flex:1; display:flex; align-items:center; justify-content:center; min-height:0; }
+  /* QR must always be black-on-white with a quiet zone, even in dark mode */
+  #qrbox { background:#fff; padding:24px; border-radius:4px; line-height:0; }
+  #qrbox img, #qrbox canvas { display:block; image-rendering:pixelated; }
+  .drop { outline:3px dashed var(--accent); outline-offset:-8px; }
+</style>
+</head>
+<body>
+<div class="wrap" id="wrap">
+  <div class="bar">
+    <h1>QR Sender</h1>
+    <input type="file" id="file" />
+    <label title="Time each data QR code is shown. Raise it if the phone misses frames.">Frame ms <input type="number" id="delay" value="200" min="30" max="5000" step="10" /></label>
+    <label title="How long the header (file name + chunk count) is shown before data starts.">Header s <input type="number" id="hdr" value="3" min="1" max="30" step="1" /></label>
+    <label title="Keep cycling through data chunks until stopped, so missed frames are picked up on the next pass."><input type="checkbox" id="loop" checked /> Loop</label>
+    <label title="Bytes of compressed data per QR code (original: 250). Larger = fewer but denser codes (harder for the camera).">Chunk B <input type="number" id="chunk" value="250" min="50" max="500" step="10" /></label>
+    <button id="start">Start</button>
+    <button id="stop" class="secondary" disabled>Stop</button>
+  </div>
+  <div class="status">
+    <span class="msg" id="msg">Choose a file. Start the receiver on the phone first, then press Start.</span>
+    <progress id="prog" max="1" value="0" hidden></progress>
+    <span class="meta" id="meta"></span>
+  </div>
+  <div class="stage"><div id="qrbox"></div></div>
+</div>
+
+<script>
+__QR_JS__
+</script>
+<script>
+__PAKO_JS__
+</script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var running = false, runId = 0, qr = null;
+
+  // --- identical encoding to the original generator.html ---------------
+  // bytes -> latin1 string -> UTF-8 bytes -> base64, prefixed with "index,"
+  function encodeChunk(index, bytes) {
+    var s = String.fromCharCode.apply(null, bytes);
+    var utf8 = new TextEncoder().encode(s);
+    return index + "," + btoa(String.fromCharCode.apply(null, utf8));
+  }
+
+  function qrSize() {
+    var stage = document.querySelector(".stage").getBoundingClientRect();
+    var side = Math.min(stage.width, stage.height) - 48; // minus #qrbox padding
+    return Math.max(160, Math.floor(side));
+  }
+
+  function makeQR(text) {
+    var box = $("qrbox");
+    box.innerHTML = "";
+    var size = qrSize();
+    qr = new QRCode(box, {
+      text: text, width: size, height: size,
+      colorDark: "#000000", colorLight: "#ffffff",
+      correctLevel: QRCode.CorrectLevel.M
+    });
+  }
+  function show(text) { qr.clear(); qr.makeCode(text); }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function fmtTime(s) { s = Math.round(s); return s < 60 ? s + " s" : Math.floor(s / 60) + " min " + (s % 60) + " s"; }
+  function fmtBytes(n) { return n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(2) + " MB"; }
+
+  function setRunning(on) {
+    running = on;
+    $("start").disabled = on; $("stop").disabled = !on;
+    ["file", "delay", "hdr", "chunk", "loop"].forEach(function (id) { $(id).disabled = on; });
+    $("prog").hidden = !on;
+  }
+
+  async function start() {
+    var file = $("file").files[0];
+    if (!file) { $("msg").textContent = "Choose a file first."; return; }
+    var delay = Math.max(30, +$("delay").value || 200);
+    var hdrMs = Math.max(1, +$("hdr").value || 3) * 1000;
+    var chunkSize = Math.min(500, Math.max(50, +$("chunk").value || 250));
+    var loop = $("loop").checked;
+    var myRun = ++runId;
+    setRunning(true);
+
+    $("msg").textContent = "Compressing…";
+    await sleep(20);
+    var data;
+    try { data = pako.gzip(new Uint8Array(await file.arrayBuffer()), { level: 9 }); }
+    catch (e) { $("msg").textContent = "Compression failed: " + e; setRunning(false); return; }
+
+    var total = Math.ceil(data.length / chunkSize);
+    // Pre-encode everything so the display loop is just makeCode()
+    var frames = new Array(total);
+    for (var i = 0; i < total; i++) frames[i] = encodeChunk(i, data.subarray(i * chunkSize, (i + 1) * chunkSize));
+
+    var info = file.name + " · " + fmtBytes(file.size) + " → " + fmtBytes(data.length) + " gzip · " + total + " codes";
+    // NOTE: the scanner clears everything it has received whenever it sees this
+    // header, so it is only shown once per transfer (not on each loop pass).
+    makeQR(JSON.stringify({ name: file.name, chunks: total }));
+    $("prog").max = total; $("prog").value = 0;
+    $("msg").textContent = "Showing header — receiver should display the file name";
+    $("meta").textContent = info;
+    await sleep(hdrMs);
+
+    var pass = 1;
+    while (running && myRun === runId) {
+      for (var j = 0; j < total; j++) {
+        if (!running || myRun !== runId) break;
+        try { show(frames[j]); }
+        catch (e) { $("msg").textContent = "QR error on chunk " + j + ": " + e; running = false; break; }
+        $("prog").value = j + 1;
+        $("msg").textContent = "Pass " + pass + " · chunk " + (j + 1) + "/" + total;
+        $("meta").textContent = info + " · ~" + fmtTime(total * delay / 1000) + " per pass";
+        await sleep(delay);
+      }
+      if (!loop) break;
+      pass++;
+    }
+    if (myRun === runId) {
+      setRunning(false);
+      $("msg").textContent = loop ? "Stopped." : "Done (single pass). If the receiver missed codes, enable Loop and resend.";
+      makeQR("Choose file to get started");
+    }
+  }
+
+  function stop() { running = false; runId++; setRunning(false); $("msg").textContent = "Stopped."; makeQR("Choose file to get started"); }
+
+  $("start").addEventListener("click", start);
+  $("stop").addEventListener("click", stop);
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && running) stop(); });
+
+  // drag & drop a file anywhere
+  var wrap = $("wrap");
+  wrap.addEventListener("dragover", function (e) { e.preventDefault(); wrap.classList.add("drop"); });
+  wrap.addEventListener("dragleave", function () { wrap.classList.remove("drop"); });
+  wrap.addEventListener("drop", function (e) {
+    e.preventDefault(); wrap.classList.remove("drop");
+    if (!running && e.dataTransfer.files.length) { $("file").files = e.dataTransfer.files; }
+  });
+
+  makeQR("Choose file to get started");
+  var t; window.addEventListener("resize", function () { if (!running) { clearTimeout(t); t = setTimeout(function () { makeQR("Choose file to get started"); }, 200); } });
+})();
+</script>
+</body>
+</html>

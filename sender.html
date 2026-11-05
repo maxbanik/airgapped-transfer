@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:;" />
+<title>QR Sender v2</title>
+<!--
+  QR transfer v2 — offline sender. Single file, no network access (blocked by CSP).
+  Pair with receiver.html (v2). Not compatible with the original scanner; use
+  sender-classic.html for that.
+
+  Bundled third-party code (MIT):
+    - Nayuki QR Code generator v1.8.0 (transpiled from qrcodegen.ts)  sha512-zpxt5A8bsl+HFnAafB9SOHbSsJzu/UuNfe744HIsNCwDT+oCiBLdKl15Zm6bwU/3kY8avWxVT5SRbuyGbooiZA==
+    - pako 2.0.3 pako_deflate.min.js  cdnjs SRI sha512-1LtY6ivTYdyp7yVk1N3ZW2wHWT+nA36dWhLNmg5FORFhEAMPdDXG30E1KeeZDYO9659MYjQBIqWEL9EnNOBb4w==
+-->
+<style>
+  :root { --bg:#f6f6f4; --fg:#1c1c1c; --muted:#6a6a6a; --line:#d6d6d2; --accent:#1f5fbf; --card:#fff; --warn:#a33; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161616; --fg:#ececec; --muted:#9a9a9a; --line:#3a3a3a; --accent:#6aa0ff; --card:#202020; --warn:#f88; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { display:flex; flex-direction:column; height:100%; padding:10px 16px; gap:8px; }
+  .bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+  .bar h1 { font-size:15px; margin:0 6px 0 0; font-weight:600; }
+  label { display:inline-flex; align-items:center; gap:6px; color:var(--muted); }
+  input[type=number], input[type=text], select { padding:4px 6px; border:1px solid var(--line); border-radius:4px; background:var(--bg); color:var(--fg); font:inherit; }
+  input[type=number] { width:70px; }
+  input[type=file] { max-width:240px; color:var(--fg); }
+  button { font:inherit; padding:5px 13px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  .status { display:flex; flex-wrap:wrap; gap:4px 16px; align-items:center; min-height:22px; }
+  .status .msg { font-weight:600; }
+  .status .meta { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .status .err { color:var(--warn); }
+  progress { width:160px; height:8px; }
+  .stage { flex:1; display:grid; justify-content:center; align-content:center; gap:0; min-height:0; background:#fff; border-radius:6px; overflow:hidden; }
+  .stage canvas { display:block; image-rendering:pixelated; }
+  .resend { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .resend input { width:min(420px, 60vw); }
+  .drop { outline:3px dashed var(--accent); outline-offset:-6px; }
+</style>
+</head>
+<body>
+<div class="wrap" id="wrap">
+  <div class="bar">
+    <h1>QR Sender v2</h1>
+    <input type="file" id="file" />
+    <label title="How long each screen of codes is shown">Frame ms <input type="number" id="delay" value="150" min="50" max="5000" step="10" /></label>
+    <label title="QR codes shown side by side per frame. More = faster if the camera can resolve them.">Codes <select id="ncodes"><option>1</option><option>2</option><option>4</option></select></label>
+    <label title="Bytes of data per QR code. Larger = fewer but denser codes.">Chunk B <input type="number" id="chunk" value="400" min="50" max="1000" step="10" /></label>
+    <label title="QR error correction. L = most data, Q = most robust.">ECC <select id="ecc"><option value="LOW">L</option><option value="MEDIUM" selected>M</option><option value="QUARTILE">Q</option></select></label>
+    <label title="How long the header is shown before data starts">Header s <input type="number" id="hdr" value="2" min="0" max="30" step="1" /></label>
+    <button id="start">Start</button>
+    <button id="pause" class="secondary" disabled>Pause</button>
+    <button id="stop" class="secondary" disabled>Stop</button>
+  </div>
+  <div class="bar resend">
+    <label for="resend" title="Paste the missing list shown on the receiver. Leave empty to send automatic repair codes after the first pass.">Resend only blocks</label>
+    <input type="text" id="resend" placeholder="e.g. 12,45-48,97  (empty = automatic repair codes)" autocomplete="off" />
+    <button id="applyResend" class="secondary" disabled>Apply</button>
+    <button id="clearResend" class="secondary" disabled>Back to auto</button>
+  </div>
+  <div class="status">
+    <span class="msg" id="msg">Choose a file, open the receiver on the phone, then press Start.</span>
+    <progress id="prog" max="1" value="0" hidden></progress>
+    <span class="meta" id="meta"></span>
+  </div>
+  <div class="stage" id="stage"></div>
+</div>
+
+<script>
+/* 
+ * QR Code generator library (TypeScript)
+ * 
+ * Copyright (c) Project Nayuki. (MIT License)
+ * https://www.nayuki.io/page/qr-code-generator-library
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ * - The above copyright notice and this permission notice shall be included in
+ *   all copies or substantial portions of the Software.
+ * - The Software is provided "as is", without warranty of any kind, express or
+ *   implied, including but not limited to the warranties of merchantability,
+ *   fitness for a particular purpose and noninfringement. In no event shall the
+ *   authors or copyright holders be liable for any claim, damages or other
+ *   liability, whether in an action of contract, tort or otherwise, arising from,
+ *   out of or in connection with the Software or the use or other dealings in the
+ *   Software.
+ */
+"use strict";var __defProp=Object.defineProperty;var __defNormalProp=(obj,key,value)=>key in obj?__defProp(obj,key,{enumerable:!0,configurable:!0,writable:!0,value}):obj[key]=value;var __publicField=(obj,key,value)=>__defNormalProp(obj,typeof key!="symbol"?key+"":key,value);var qrcodegen;(qrcodegen2=>{const _QrCode=class _QrCode{constructor(version,errorCorrectionLevel,dataCodewords,msk){this.version=version;this.errorCorrectionLevel=errorCorrectionLevel;__publicField(this,"size");__publicField(this,"mask");__publicField(this,"modules",[]);__publicField(this,"isFunction",[]);if(version<_QrCode.MIN_VERSION||version>_QrCode.MAX_VERSION)throw new RangeError("Version value out of range");if(msk<-1||msk>7)throw new RangeError("Mask value out of range");this.size=version*4+17;let row=[];for(let i=0;i<this.size;i++)row.push(!1);for(let i=0;i<this.size;i++)this.modules.push(row.slice()),this.isFunction.push(row.slice());this.drawFunctionPatterns();const allCodewords=this.addEccAndInterleave(dataCodewords);if(this.drawCodewords(allCodewords),msk==-1){let minPenalty=1e9;for(let i=0;i<8;i++){this.applyMask(i),this.drawFormatBits(i);const penalty=this.getPenaltyScore();penalty<minPenalty&&(msk=i,minPenalty=penalty),this.applyMask(i)}}assert(0<=msk&&msk<=7),this.mask=msk,this.applyMask(msk),this.drawFormatBits(msk),this.isFunction=[]}static encodeText(text,ecl){const segs=qrcodegen2.QrSegment.makeSegments(text);return _QrCode.encodeSegments(segs,ecl)}static encodeBinary(data,ecl){const seg=qrcodegen2.QrSegment.makeBytes(data);return _QrCode.encodeSegments([seg],ecl)}static encodeSegments(segs,ecl,minVersion=1,maxVersion=40,mask=-1,boostEcl=!0){if(!(_QrCode.MIN_VERSION<=minVersion&&minVersion<=maxVersion&&maxVersion<=_QrCode.MAX_VERSION)||mask<-1||mask>7)throw new RangeError("Invalid value");let version,dataUsedBits;for(version=minVersion;;version++){const dataCapacityBits2=_QrCode.getNumDataCodewords(version,ecl)*8,usedBits=QrSegment.getTotalBits(segs,version);if(usedBits<=dataCapacityBits2){dataUsedBits=usedBits;break}if(version>=maxVersion)throw new RangeError("Data too long")}for(const newEcl of[_QrCode.Ecc.MEDIUM,_QrCode.Ecc.QUARTILE,_QrCode.Ecc.HIGH])boostEcl&&dataUsedBits<=_QrCode.getNumDataCodewords(version,newEcl)*8&&(ecl=newEcl);let bb=[];for(const seg of segs){appendBits(seg.mode.modeBits,4,bb),appendBits(seg.numChars,seg.mode.numCharCountBits(version),bb);for(const b of seg.getData())bb.push(b)}assert(bb.length==dataUsedBits);const dataCapacityBits=_QrCode.getNumDataCodewords(version,ecl)*8;assert(bb.length<=dataCapacityBits),appendBits(0,Math.min(4,dataCapacityBits-bb.length),bb),appendBits(0,(8-bb.length%8)%8,bb),assert(bb.length%8==0);for(let padByte=236;bb.length<dataCapacityBits;padByte^=253)appendBits(padByte,8,bb);let dataCodewords=[];for(;dataCodewords.length*8<bb.length;)dataCodewords.push(0);return bb.forEach((b,i)=>dataCodewords[i>>>3]|=b<<7-(i&7)),new _QrCode(version,ecl,dataCodewords,mask)}getModule(x,y){return 0<=x&&x<this.size&&0<=y&&y<this.size&&this.modules[y][x]}drawFunctionPatterns(){for(let i=0;i<this.size;i++)this.setFunctionModule(6,i,i%2==0),this.setFunctionModule(i,6,i%2==0);this.drawFinderPattern(3,3),this.drawFinderPattern(this.size-4,3),this.drawFinderPattern(3,this.size-4);const alignPatPos=this.getAlignmentPatternPositions(),numAlign=alignPatPos.length;for(let i=0;i<numAlign;i++)for(let j=0;j<numAlign;j++)i==0&&j==0||i==0&&j==numAlign-1||i==numAlign-1&&j==0||this.drawAlignmentPattern(alignPatPos[i],alignPatPos[j]);this.drawFormatBits(0),this.drawVersion()}drawFormatBits(mask){const data=this.errorCorrectionLevel.formatBits<<3|mask;let rem=data;for(let i=0;i<10;i++)rem=rem<<1^(rem>>>9)*1335;const bits=(data<<10|rem)^21522;assert(bits>>>15==0);for(let i=0;i<=5;i++)this.setFunctionModule(8,i,getBit(bits,i));this.setFunctionModule(8,7,getBit(bits,6)),this.setFunctionModule(8,8,getBit(bits,7)),this.setFunctionModule(7,8,getBit(bits,8));for(let i=9;i<15;i++)this.setFunctionModule(14-i,8,getBit(bits,i));for(let i=0;i<8;i++)this.setFunctionModule(this.size-1-i,8,getBit(bits,i));for(let i=8;i<15;i++)this.setFunctionModule(8,this.size-15+i,getBit(bits,i));this.setFunctionModule(8,this.size-8,!0)}drawVersion(){if(this.version<7)return;let rem=this.version;for(let i=0;i<12;i++)rem=rem<<1^(rem>>>11)*7973;const bits=this.version<<12|rem;assert(bits>>>18==0);for(let i=0;i<18;i++){const color=getBit(bits,i),a=this.size-11+i%3,b=Math.floor(i/3);this.setFunctionModule(a,b,color),this.setFunctionModule(b,a,color)}}drawFinderPattern(x,y){for(let dy=-4;dy<=4;dy++)for(let dx=-4;dx<=4;dx++){const dist=Math.max(Math.abs(dx),Math.abs(dy)),xx=x+dx,yy=y+dy;0<=xx&&xx<this.size&&0<=yy&&yy<this.size&&this.setFunctionModule(xx,yy,dist!=2&&dist!=4)}}drawAlignmentPattern(x,y){for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++)this.setFunctionModule(x+dx,y+dy,Math.max(Math.abs(dx),Math.abs(dy))!=1)}setFunctionModule(x,y,isDark){this.modules[y][x]=isDark,this.isFunction[y][x]=!0}addEccAndInterleave(data){const ver=this.version,ecl=this.errorCorrectionLevel;if(data.length!=_QrCode.getNumDataCodewords(ver,ecl))throw new RangeError("Invalid argument");const numBlocks=_QrCode.NUM_ERROR_CORRECTION_BLOCKS[ecl.ordinal][ver],blockEccLen=_QrCode.ECC_CODEWORDS_PER_BLOCK[ecl.ordinal][ver],rawCodewords=Math.floor(_QrCode.getNumRawDataModules(ver)/8),numShortBlocks=numBlocks-rawCodewords%numBlocks,shortBlockLen=Math.floor(rawCodewords/numBlocks);let blocks=[];const rsDiv=_QrCode.reedSolomonComputeDivisor(blockEccLen);for(let i=0,k=0;i<numBlocks;i++){let dat=data.slice(k,k+shortBlockLen-blockEccLen+(i<numShortBlocks?0:1));k+=dat.length;const ecc=_QrCode.reedSolomonComputeRemainder(dat,rsDiv);i<numShortBlocks&&dat.push(0),blocks.push(dat.concat(ecc))}let result=[];for(let i=0;i<blocks[0].length;i++)blocks.forEach((block,j)=>{(i!=shortBlockLen-blockEccLen||j>=numShortBlocks)&&result.push(block[i])});return assert(result.length==rawCodewords),result}drawCodewords(data){if(data.length!=Math.floor(_QrCode.getNumRawDataModules(this.version)/8))throw new RangeError("Invalid argument");let i=0;for(let right=this.size-1;right>=1;right-=2){right==6&&(right=5);for(let vert=0;vert<this.size;vert++)for(let j=0;j<2;j++){const x=right-j,y=(right+1&2)==0?this.size-1-vert:vert;!this.isFunction[y][x]&&i<data.length*8&&(this.modules[y][x]=getBit(data[i>>>3],7-(i&7)),i++)}}assert(i==data.length*8)}applyMask(mask){if(mask<0||mask>7)throw new RangeError("Mask value out of range");for(let y=0;y<this.size;y++)for(let x=0;x<this.size;x++){let invert;switch(mask){case 0:invert=(x+y)%2==0;break;case 1:invert=y%2==0;break;case 2:invert=x%3==0;break;case 3:invert=(x+y)%3==0;break;case 4:invert=(Math.floor(x/3)+Math.floor(y/2))%2==0;break;case 5:invert=x*y%2+x*y%3==0;break;case 6:invert=(x*y%2+x*y%3)%2==0;break;case 7:invert=((x+y)%2+x*y%3)%2==0;break;default:throw new Error("Unreachable")}!this.isFunction[y][x]&&invert&&(this.modules[y][x]=!this.modules[y][x])}}getPenaltyScore(){let result=0;for(let y=0;y<this.size;y++){let runColor=!1,runX=0,runHistory=[0,0,0,0,0,0,0];for(let x=0;x<this.size;x++)this.modules[y][x]==runColor?(runX++,runX==5?result+=_QrCode.PENALTY_N1:runX>5&&result++):(this.finderPenaltyAddHistory(runX,runHistory),runColor||(result+=this.finderPenaltyCountPatterns(runHistory)*_QrCode.PENALTY_N3),runColor=this.modules[y][x],runX=1);result+=this.finderPenaltyTerminateAndCount(runColor,runX,runHistory)*_QrCode.PENALTY_N3}for(let x=0;x<this.size;x++){let runColor=!1,runY=0,runHistory=[0,0,0,0,0,0,0];for(let y=0;y<this.size;y++)this.modules[y][x]==runColor?(runY++,runY==5?result+=_QrCode.PENALTY_N1:runY>5&&result++):(this.finderPenaltyAddHistory(runY,runHistory),runColor||(result+=this.finderPenaltyCountPatterns(runHistory)*_QrCode.PENALTY_N3),runColor=this.modules[y][x],runY=1);result+=this.finderPenaltyTerminateAndCount(runColor,runY,runHistory)*_QrCode.PENALTY_N3}for(let y=0;y<this.size-1;y++)for(let x=0;x<this.size-1;x++){const color=this.modules[y][x];color==this.modules[y][x+1]&&color==this.modules[y+1][x]&&color==this.modules[y+1][x+1]&&(result+=_QrCode.PENALTY_N2)}let dark=0;for(const row of this.modules)dark=row.reduce((sum,color)=>sum+(color?1:0),dark);const total=this.size*this.size,k=Math.ceil(Math.abs(dark*20-total*10)/total)-1;return assert(0<=k&&k<=9),result+=k*_QrCode.PENALTY_N4,assert(0<=result&&result<=2568888),result}getAlignmentPatternPositions(){if(this.version==1)return[];{const numAlign=Math.floor(this.version/7)+2,step=this.version==32?26:Math.ceil((this.version*4+4)/(numAlign*2-2))*2;let result=[6];for(let pos=this.size-7;result.length<numAlign;pos-=step)result.splice(1,0,pos);return result}}static getNumRawDataModules(ver){if(ver<_QrCode.MIN_VERSION||ver>_QrCode.MAX_VERSION)throw new RangeError("Version number out of range");let result=(16*ver+128)*ver+64;if(ver>=2){const numAlign=Math.floor(ver/7)+2;result-=(25*numAlign-10)*numAlign-55,ver>=7&&(result-=36)}return assert(208<=result&&result<=29648),result}static getNumDataCodewords(ver,ecl){return Math.floor(_QrCode.getNumRawDataModules(ver)/8)-_QrCode.ECC_CODEWORDS_PER_BLOCK[ecl.ordinal][ver]*_QrCode.NUM_ERROR_CORRECTION_BLOCKS[ecl.ordinal][ver]}static reedSolomonComputeDivisor(degree){if(degree<1||degree>255)throw new RangeError("Degree out of range");let result=[];for(let i=0;i<degree-1;i++)result.push(0);result.push(1);let root=1;for(let i=0;i<degree;i++){for(let j=0;j<result.length;j++)result[j]=_QrCode.reedSolomonMultiply(result[j],root),j+1<result.length&&(result[j]^=result[j+1]);root=_QrCode.reedSolomonMultiply(root,2)}return result}static reedSolomonComputeRemainder(data,divisor){let result=divisor.map(_=>0);for(const b of data){const factor=b^result.shift();result.push(0),divisor.forEach((coef,i)=>result[i]^=_QrCode.reedSolomonMultiply(coef,factor))}return result}static reedSolomonMultiply(x,y){if(x>>>8||y>>>8)throw new RangeError("Byte out of range");let z=0;for(let i=7;i>=0;i--)z=z<<1^(z>>>7)*285,z^=(y>>>i&1)*x;return assert(z>>>8==0),z}finderPenaltyCountPatterns(runHistory){const n=runHistory[1];assert(n<=this.size*3);const core=n>0&&runHistory[2]==n&&runHistory[3]==n*3&&runHistory[4]==n&&runHistory[5]==n;return(core&&runHistory[0]>=n*4&&runHistory[6]>=n?1:0)+(core&&runHistory[6]>=n*4&&runHistory[0]>=n?1:0)}finderPenaltyTerminateAndCount(currentRunColor,currentRunLength,runHistory){return currentRunColor&&(this.finderPenaltyAddHistory(currentRunLength,runHistory),currentRunLength=0),currentRunLength+=this.size,this.finderPenaltyAddHistory(currentRunLength,runHistory),this.finderPenaltyCountPatterns(runHistory)}finderPenaltyAddHistory(currentRunLength,runHistory){runHistory[0]==0&&(currentRunLength+=this.size),runHistory.pop(),runHistory.unshift(currentRunLength)}};__publicField(_QrCode,"MIN_VERSION",1),__publicField(_QrCode,"MAX_VERSION",40),__publicField(_QrCode,"PENALTY_N1",3),__publicField(_QrCode,"PENALTY_N2",3),__publicField(_QrCode,"PENALTY_N3",40),__publicField(_QrCode,"PENALTY_N4",10),__publicField(_QrCode,"ECC_CODEWORDS_PER_BLOCK",[[-1,7,10,15,20,26,18,20,24,30,18,20,24,26,30,22,24,28,30,28,28,28,28,30,30,26,28,30,30,30,30,30,30,30,30,30,30,30,30,30,30],[-1,10,16,26,18,24,16,18,22,22,26,30,22,22,24,24,28,28,26,26,26,26,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28],[-1,13,22,18,26,18,24,18,22,20,24,28,26,24,20,30,24,28,28,26,30,28,30,30,30,30,28,30,30,30,30,30,30,30,30,30,30,30,30,30,30],[-1,17,28,22,16,22,28,26,26,24,28,24,28,22,24,24,30,28,28,26,28,30,24,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30]]),__publicField(_QrCode,"NUM_ERROR_CORRECTION_BLOCKS",[[-1,1,1,1,1,1,2,2,2,2,4,4,4,4,4,6,6,6,6,7,8,8,9,9,10,12,12,12,13,14,15,16,17,18,19,19,20,21,22,24,25],[-1,1,1,1,2,2,4,4,4,5,5,5,8,9,9,10,10,11,13,14,16,17,17,18,20,21,23,25,26,28,29,31,33,35,37,38,40,43,45,47,49],[-1,1,1,2,2,4,4,6,6,8,8,8,10,12,16,12,17,16,18,21,20,23,23,25,27,29,34,34,35,38,40,43,45,48,51,53,56,59,62,65,68],[-1,1,1,2,4,4,4,5,6,8,8,11,11,16,16,18,16,19,21,25,25,25,34,30,32,35,37,40,42,45,48,51,54,57,60,63,66,70,74,77,81]]);let QrCode=_QrCode;qrcodegen2.QrCode=_QrCode;function appendBits(val,len,bb){if(len<0||len>31||val>>>len)throw new RangeError("Value out of range");for(let i=len-1;i>=0;i--)bb.push(val>>>i&1)}function getBit(x,i){return(x>>>i&1)!=0}function assert(cond){if(!cond)throw new Error("Assertion error")}const _QrSegment=class _QrSegment{constructor(mode,numChars,bitData){this.mode=mode;this.numChars=numChars;this.bitData=bitData;if(numChars<0)throw new RangeError("Invalid argument");this.bitData=bitData.slice()}static makeBytes(data){let bb=[];for(const b of data)appendBits(b,8,bb);return new _QrSegment(_QrSegment.Mode.BYTE,data.length,bb)}static makeNumeric(digits){if(!_QrSegment.isNumeric(digits))throw new RangeError("String contains non-numeric characters");let bb=[];for(let i=0;i<digits.length;){const n=Math.min(digits.length-i,3);appendBits(parseInt(digits.substr(i,n),10),n*3+1,bb),i+=n}return new _QrSegment(_QrSegment.Mode.NUMERIC,digits.length,bb)}static makeAlphanumeric(text){if(!_QrSegment.isAlphanumeric(text))throw new RangeError("String contains unencodable characters in alphanumeric mode");let bb=[],i;for(i=0;i+2<=text.length;i+=2){let temp=_QrSegment.ALPHANUMERIC_CHARSET.indexOf(text.charAt(i))*45;temp+=_QrSegment.ALPHANUMERIC_CHARSET.indexOf(text.charAt(i+1)),appendBits(temp,11,bb)}return i<text.length&&appendBits(_QrSegment.ALPHANUMERIC_CHARSET.indexOf(text.charAt(i)),6,bb),new _QrSegment(_QrSegment.Mode.ALPHANUMERIC,text.length,bb)}static makeSegments(text){return text==""?[]:_QrSegment.isNumeric(text)?[_QrSegment.makeNumeric(text)]:_QrSegment.isAlphanumeric(text)?[_QrSegment.makeAlphanumeric(text)]:[_QrSegment.makeBytes(_QrSegment.toUtf8ByteArray(text))]}static makeEci(assignVal){let bb=[];if(assignVal<0)throw new RangeError("ECI assignment value out of range");if(assignVal<128)appendBits(assignVal,8,bb);else if(assignVal<16384)appendBits(2,2,bb),appendBits(assignVal,14,bb);else if(assignVal<1e6)appendBits(6,3,bb),appendBits(assignVal,21,bb);else throw new RangeError("ECI assignment value out of range");return new _QrSegment(_QrSegment.Mode.ECI,0,bb)}static isNumeric(text){return _QrSegment.NUMERIC_REGEX.test(text)}static isAlphanumeric(text){return _QrSegment.ALPHANUMERIC_REGEX.test(text)}getData(){return this.bitData.slice()}static getTotalBits(segs,version){let result=0;for(const seg of segs){const ccbits=seg.mode.numCharCountBits(version);if(seg.numChars>=1<<ccbits)return 1/0;result+=4+ccbits+seg.bitData.length}return result}static toUtf8ByteArray(str){str=encodeURI(str);let result=[];for(let i=0;i<str.length;i++)str.charAt(i)!="%"?result.push(str.charCodeAt(i)):(result.push(parseInt(str.substr(i+1,2),16)),i+=2);return result}};__publicField(_QrSegment,"NUMERIC_REGEX",/^[0-9]*$/),__publicField(_QrSegment,"ALPHANUMERIC_REGEX",/^[A-Z0-9 $%*+.\/:-]*$/),__publicField(_QrSegment,"ALPHANUMERIC_CHARSET","0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:");let QrSegment=_QrSegment;qrcodegen2.QrSegment=_QrSegment})(qrcodegen||(qrcodegen={})),(qrcodegen2=>{let QrCode;(QrCode2=>{const _Ecc=class _Ecc{constructor(ordinal,formatBits){this.ordinal=ordinal;this.formatBits=formatBits}};__publicField(_Ecc,"LOW",new _Ecc(0,1)),__publicField(_Ecc,"MEDIUM",new _Ecc(1,0)),__publicField(_Ecc,"QUARTILE",new _Ecc(2,3)),__publicField(_Ecc,"HIGH",new _Ecc(3,2));let Ecc=_Ecc;QrCode2.Ecc=_Ecc})(QrCode=qrcodegen2.QrCode||(qrcodegen2.QrCode={}))})(qrcodegen||(qrcodegen={})),(qrcodegen2=>{let QrSegment;(QrSegment2=>{const _Mode=class _Mode{constructor(modeBits,numBitsCharCount){this.modeBits=modeBits;this.numBitsCharCount=numBitsCharCount}numCharCountBits(ver){return this.numBitsCharCount[Math.floor((ver+7)/17)]}};__publicField(_Mode,"NUMERIC",new _Mode(1,[10,12,14])),__publicField(_Mode,"ALPHANUMERIC",new _Mode(2,[9,11,13])),__publicField(_Mode,"BYTE",new _Mode(4,[8,16,16])),__publicField(_Mode,"KANJI",new _Mode(8,[8,10,12])),__publicField(_Mode,"ECI",new _Mode(7,[0,0,0]));let Mode=_Mode;QrSegment2.Mode=_Mode})(QrSegment=qrcodegen2.QrSegment||(qrcodegen2.QrSegment={}))})(qrcodegen||(qrcodegen={}));
+
+</script>
+<script>
+/*! pako 2.0.3 https://github.com/nodeca/pako @license (MIT AND Zlib) */
+!function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"function"==typeof define&&define.amd?define(["exports"],e):e((t="undefined"!=typeof globalThis?globalThis:t||self).pako={})}(this,(function(t){"use strict";function e(t){let e=t.length;for(;--e>=0;)t[e]=0}const a=256,n=286,r=30,i=15,s=new Uint8Array([0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]),_=new Uint8Array([0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]),l=new Uint8Array([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,3,7]),h=new Uint8Array([16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]),o=new Array(576);e(o);const d=new Array(60);e(d);const u=new Array(512);e(u);const f=new Array(256);e(f);const c=new Array(29);e(c);const p=new Array(r);function g(t,e,a,n,r){this.static_tree=t,this.extra_bits=e,this.extra_base=a,this.elems=n,this.max_length=r,this.has_stree=t&&t.length}let w,b,m;function v(t,e){this.dyn_tree=t,this.max_code=0,this.stat_desc=e}e(p);const y=t=>t<256?u[t]:u[256+(t>>>7)],z=(t,e)=>{t.pending_buf[t.pending++]=255&e,t.pending_buf[t.pending++]=e>>>8&255},k=(t,e,a)=>{t.bi_valid>16-a?(t.bi_buf|=e<<t.bi_valid&65535,z(t,t.bi_buf),t.bi_buf=e>>16-t.bi_valid,t.bi_valid+=a-16):(t.bi_buf|=e<<t.bi_valid&65535,t.bi_valid+=a)},x=(t,e,a)=>{k(t,a[2*e],a[2*e+1])},A=(t,e)=>{let a=0;do{a|=1&t,t>>>=1,a<<=1}while(--e>0);return a>>>1},E=(t,e,a)=>{const n=new Array(16);let r,s,_=0;for(r=1;r<=i;r++)n[r]=_=_+a[r-1]<<1;for(s=0;s<=e;s++){let e=t[2*s+1];0!==e&&(t[2*s]=A(n[e]++,e))}},Z=t=>{let e;for(e=0;e<n;e++)t.dyn_ltree[2*e]=0;for(e=0;e<r;e++)t.dyn_dtree[2*e]=0;for(e=0;e<19;e++)t.bl_tree[2*e]=0;t.dyn_ltree[512]=1,t.opt_len=t.static_len=0,t.last_lit=t.matches=0},R=t=>{t.bi_valid>8?z(t,t.bi_buf):t.bi_valid>0&&(t.pending_buf[t.pending++]=t.bi_buf),t.bi_buf=0,t.bi_valid=0},U=(t,e,a,n)=>{const r=2*e,i=2*a;return t[r]<t[i]||t[r]===t[i]&&n[e]<=n[a]},S=(t,e,a)=>{const n=t.heap[a];let r=a<<1;for(;r<=t.heap_len&&(r<t.heap_len&&U(e,t.heap[r+1],t.heap[r],t.depth)&&r++,!U(e,n,t.heap[r],t.depth));)t.heap[a]=t.heap[r],a=r,r<<=1;t.heap[a]=n},L=(t,e,n)=>{let r,i,l,h,o=0;if(0!==t.last_lit)do{r=t.pending_buf[t.d_buf+2*o]<<8|t.pending_buf[t.d_buf+2*o+1],i=t.pending_buf[t.l_buf+o],o++,0===r?x(t,i,e):(l=f[i],x(t,l+a+1,e),h=s[l],0!==h&&(i-=c[l],k(t,i,h)),r--,l=y(r),x(t,l,n),h=_[l],0!==h&&(r-=p[l],k(t,r,h)))}while(o<t.last_lit);x(t,256,e)},F=(t,e)=>{const a=e.dyn_tree,n=e.stat_desc.static_tree,r=e.stat_desc.has_stree,s=e.stat_desc.elems;let _,l,h,o=-1;for(t.heap_len=0,t.heap_max=573,_=0;_<s;_++)0!==a[2*_]?(t.heap[++t.heap_len]=o=_,t.depth[_]=0):a[2*_+1]=0;for(;t.heap_len<2;)h=t.heap[++t.heap_len]=o<2?++o:0,a[2*h]=1,t.depth[h]=0,t.opt_len--,r&&(t.static_len-=n[2*h+1]);for(e.max_code=o,_=t.heap_len>>1;_>=1;_--)S(t,a,_);h=s;do{_=t.heap[1],t.heap[1]=t.heap[t.heap_len--],S(t,a,1),l=t.heap[1],t.heap[--t.heap_max]=_,t.heap[--t.heap_max]=l,a[2*h]=a[2*_]+a[2*l],t.depth[h]=(t.depth[_]>=t.depth[l]?t.depth[_]:t.depth[l])+1,a[2*_+1]=a[2*l+1]=h,t.heap[1]=h++,S(t,a,1)}while(t.heap_len>=2);t.heap[--t.heap_max]=t.heap[1],((t,e)=>{const a=e.dyn_tree,n=e.max_code,r=e.stat_desc.static_tree,s=e.stat_desc.has_stree,_=e.stat_desc.extra_bits,l=e.stat_desc.extra_base,h=e.stat_desc.max_length;let o,d,u,f,c,p,g=0;for(f=0;f<=i;f++)t.bl_count[f]=0;for(a[2*t.heap[t.heap_max]+1]=0,o=t.heap_max+1;o<573;o++)d=t.heap[o],f=a[2*a[2*d+1]+1]+1,f>h&&(f=h,g++),a[2*d+1]=f,d>n||(t.bl_count[f]++,c=0,d>=l&&(c=_[d-l]),p=a[2*d],t.opt_len+=p*(f+c),s&&(t.static_len+=p*(r[2*d+1]+c)));if(0!==g){do{for(f=h-1;0===t.bl_count[f];)f--;t.bl_count[f]--,t.bl_count[f+1]+=2,t.bl_count[h]--,g-=2}while(g>0);for(f=h;0!==f;f--)for(d=t.bl_count[f];0!==d;)u=t.heap[--o],u>n||(a[2*u+1]!==f&&(t.opt_len+=(f-a[2*u+1])*a[2*u],a[2*u+1]=f),d--)}})(t,e),E(a,o,t.bl_count)},O=(t,e,a)=>{let n,r,i=-1,s=e[1],_=0,l=7,h=4;for(0===s&&(l=138,h=3),e[2*(a+1)+1]=65535,n=0;n<=a;n++)r=s,s=e[2*(n+1)+1],++_<l&&r===s||(_<h?t.bl_tree[2*r]+=_:0!==r?(r!==i&&t.bl_tree[2*r]++,t.bl_tree[32]++):_<=10?t.bl_tree[34]++:t.bl_tree[36]++,_=0,i=r,0===s?(l=138,h=3):r===s?(l=6,h=3):(l=7,h=4))},T=(t,e,a)=>{let n,r,i=-1,s=e[1],_=0,l=7,h=4;for(0===s&&(l=138,h=3),n=0;n<=a;n++)if(r=s,s=e[2*(n+1)+1],!(++_<l&&r===s)){if(_<h)do{x(t,r,t.bl_tree)}while(0!=--_);else 0!==r?(r!==i&&(x(t,r,t.bl_tree),_--),x(t,16,t.bl_tree),k(t,_-3,2)):_<=10?(x(t,17,t.bl_tree),k(t,_-3,3)):(x(t,18,t.bl_tree),k(t,_-11,7));_=0,i=r,0===s?(l=138,h=3):r===s?(l=6,h=3):(l=7,h=4)}};let D=!1;const N=(t,e,a,n)=>{k(t,0+(n?1:0),3),((t,e,a,n)=>{R(t),n&&(z(t,a),z(t,~a)),t.pending_buf.set(t.window.subarray(e,e+a),t.pending),t.pending+=a})(t,e,a,!0)};var I={_tr_init:t=>{D||((()=>{let t,e,a,h,v;const y=new Array(16);for(a=0,h=0;h<28;h++)for(c[h]=a,t=0;t<1<<s[h];t++)f[a++]=h;for(f[a-1]=h,v=0,h=0;h<16;h++)for(p[h]=v,t=0;t<1<<_[h];t++)u[v++]=h;for(v>>=7;h<r;h++)for(p[h]=v<<7,t=0;t<1<<_[h]-7;t++)u[256+v++]=h;for(e=0;e<=i;e++)y[e]=0;for(t=0;t<=143;)o[2*t+1]=8,t++,y[8]++;for(;t<=255;)o[2*t+1]=9,t++,y[9]++;for(;t<=279;)o[2*t+1]=7,t++,y[7]++;for(;t<=287;)o[2*t+1]=8,t++,y[8]++;for(E(o,287,y),t=0;t<r;t++)d[2*t+1]=5,d[2*t]=A(t,5);w=new g(o,s,257,n,i),b=new g(d,_,0,r,i),m=new g(new Array(0),l,0,19,7)})(),D=!0),t.l_desc=new v(t.dyn_ltree,w),t.d_desc=new v(t.dyn_dtree,b),t.bl_desc=new v(t.bl_tree,m),t.bi_buf=0,t.bi_valid=0,Z(t)},_tr_stored_block:N,_tr_flush_block:(t,e,n,r)=>{let i,s,_=0;t.level>0?(2===t.strm.data_type&&(t.strm.data_type=(t=>{let e,n=4093624447;for(e=0;e<=31;e++,n>>>=1)if(1&n&&0!==t.dyn_ltree[2*e])return 0;if(0!==t.dyn_ltree[18]||0!==t.dyn_ltree[20]||0!==t.dyn_ltree[26])return 1;for(e=32;e<a;e++)if(0!==t.dyn_ltree[2*e])return 1;return 0})(t)),F(t,t.l_desc),F(t,t.d_desc),_=(t=>{let e;for(O(t,t.dyn_ltree,t.l_desc.max_code),O(t,t.dyn_dtree,t.d_desc.max_code),F(t,t.bl_desc),e=18;e>=3&&0===t.bl_tree[2*h[e]+1];e--);return t.opt_len+=3*(e+1)+5+5+4,e})(t),i=t.opt_len+3+7>>>3,s=t.static_len+3+7>>>3,s<=i&&(i=s)):i=s=n+5,n+4<=i&&-1!==e?N(t,e,n,r):4===t.strategy||s===i?(k(t,2+(r?1:0),3),L(t,o,d)):(k(t,4+(r?1:0),3),((t,e,a,n)=>{let r;for(k(t,e-257,5),k(t,a-1,5),k(t,n-4,4),r=0;r<n;r++)k(t,t.bl_tree[2*h[r]+1],3);T(t,t.dyn_ltree,e-1),T(t,t.dyn_dtree,a-1)})(t,t.l_desc.max_code+1,t.d_desc.max_code+1,_+1),L(t,t.dyn_ltree,t.dyn_dtree)),Z(t),r&&R(t)},_tr_tally:(t,e,n)=>(t.pending_buf[t.d_buf+2*t.last_lit]=e>>>8&255,t.pending_buf[t.d_buf+2*t.last_lit+1]=255&e,t.pending_buf[t.l_buf+t.last_lit]=255&n,t.last_lit++,0===e?t.dyn_ltree[2*n]++:(t.matches++,e--,t.dyn_ltree[2*(f[n]+a+1)]++,t.dyn_dtree[2*y(e)]++),t.last_lit===t.lit_bufsize-1),_tr_align:t=>{k(t,2,3),x(t,256,o),(t=>{16===t.bi_valid?(z(t,t.bi_buf),t.bi_buf=0,t.bi_valid=0):t.bi_valid>=8&&(t.pending_buf[t.pending++]=255&t.bi_buf,t.bi_buf>>=8,t.bi_valid-=8)})(t)}};var C=(t,e,a,n)=>{let r=65535&t|0,i=t>>>16&65535|0,s=0;for(;0!==a;){s=a>2e3?2e3:a,a-=s;do{r=r+e[n++]|0,i=i+r|0}while(--s);r%=65521,i%=65521}return r|i<<16|0};const B=new Uint32Array((()=>{let t,e=[];for(var a=0;a<256;a++){t=a;for(var n=0;n<8;n++)t=1&t?3988292384^t>>>1:t>>>1;e[a]=t}return e})());var H=(t,e,a,n)=>{const r=B,i=n+a;t^=-1;for(let a=n;a<i;a++)t=t>>>8^r[255&(t^e[a])];return-1^t},M={2:"need dictionary",1:"stream end",0:"","-1":"file error","-2":"stream error","-3":"data error","-4":"insufficient memory","-5":"buffer error","-6":"incompatible version"},P={Z_NO_FLUSH:0,Z_PARTIAL_FLUSH:1,Z_SYNC_FLUSH:2,Z_FULL_FLUSH:3,Z_FINISH:4,Z_BLOCK:5,Z_TREES:6,Z_OK:0,Z_STREAM_END:1,Z_NEED_DICT:2,Z_ERRNO:-1,Z_STREAM_ERROR:-2,Z_DATA_ERROR:-3,Z_MEM_ERROR:-4,Z_BUF_ERROR:-5,Z_NO_COMPRESSION:0,Z_BEST_SPEED:1,Z_BEST_COMPRESSION:9,Z_DEFAULT_COMPRESSION:-1,Z_FILTERED:1,Z_HUFFMAN_ONLY:2,Z_RLE:3,Z_FIXED:4,Z_DEFAULT_STRATEGY:0,Z_BINARY:0,Z_TEXT:1,Z_UNKNOWN:2,Z_DEFLATED:8};const{_tr_init:j,_tr_stored_block:K,_tr_flush_block:Y,_tr_tally:G,_tr_align:X}=I,{Z_NO_FLUSH:W,Z_PARTIAL_FLUSH:q,Z_FULL_FLUSH:J,Z_FINISH:Q,Z_BLOCK:V,Z_OK:$,Z_STREAM_END:tt,Z_STREAM_ERROR:et,Z_DATA_ERROR:at,Z_BUF_ERROR:nt,Z_DEFAULT_COMPRESSION:rt,Z_FILTERED:it,Z_HUFFMAN_ONLY:st,Z_RLE:_t,Z_FIXED:lt,Z_DEFAULT_STRATEGY:ht,Z_UNKNOWN:ot,Z_DEFLATED:dt}=P,ut=258,ft=262,ct=103,pt=113,gt=666,wt=(t,e)=>(t.msg=M[e],e),bt=t=>(t<<1)-(t>4?9:0),mt=t=>{let e=t.length;for(;--e>=0;)t[e]=0};let vt=(t,e,a)=>(e<<t.hash_shift^a)&t.hash_mask;const yt=t=>{const e=t.state;let a=e.pending;a>t.avail_out&&(a=t.avail_out),0!==a&&(t.output.set(e.pending_buf.subarray(e.pending_out,e.pending_out+a),t.next_out),t.next_out+=a,e.pending_out+=a,t.total_out+=a,t.avail_out-=a,e.pending-=a,0===e.pending&&(e.pending_out=0))},zt=(t,e)=>{Y(t,t.block_start>=0?t.block_start:-1,t.strstart-t.block_start,e),t.block_start=t.strstart,yt(t.strm)},kt=(t,e)=>{t.pending_buf[t.pending++]=e},xt=(t,e)=>{t.pending_buf[t.pending++]=e>>>8&255,t.pending_buf[t.pending++]=255&e},At=(t,e,a,n)=>{let r=t.avail_in;return r>n&&(r=n),0===r?0:(t.avail_in-=r,e.set(t.input.subarray(t.next_in,t.next_in+r),a),1===t.state.wrap?t.adler=C(t.adler,e,r,a):2===t.state.wrap&&(t.adler=H(t.adler,e,r,a)),t.next_in+=r,t.total_in+=r,r)},Et=(t,e)=>{let a,n,r=t.max_chain_length,i=t.strstart,s=t.prev_length,_=t.nice_match;const l=t.strstart>t.w_size-ft?t.strstart-(t.w_size-ft):0,h=t.window,o=t.w_mask,d=t.prev,u=t.strstart+ut;let f=h[i+s-1],c=h[i+s];t.prev_length>=t.good_match&&(r>>=2),_>t.lookahead&&(_=t.lookahead);do{if(a=e,h[a+s]===c&&h[a+s-1]===f&&h[a]===h[i]&&h[++a]===h[i+1]){i+=2,a++;do{}while(h[++i]===h[++a]&&h[++i]===h[++a]&&h[++i]===h[++a]&&h[++i]===h[++a]&&h[++i]===h[++a]&&h[++i]===h[++a]&&h[++i]===h[++a]&&h[++i]===h[++a]&&i<u);if(n=ut-(u-i),i=u-ut,n>s){if(t.match_start=e,s=n,n>=_)break;f=h[i+s-1],c=h[i+s]}}}while((e=d[e&o])>l&&0!=--r);return s<=t.lookahead?s:t.lookahead},Zt=t=>{const e=t.w_size;let a,n,r,i,s;do{if(i=t.window_size-t.lookahead-t.strstart,t.strstart>=e+(e-ft)){t.window.set(t.window.subarray(e,e+e),0),t.match_start-=e,t.strstart-=e,t.block_start-=e,n=t.hash_size,a=n;do{r=t.head[--a],t.head[a]=r>=e?r-e:0}while(--n);n=e,a=n;do{r=t.prev[--a],t.prev[a]=r>=e?r-e:0}while(--n);i+=e}if(0===t.strm.avail_in)break;if(n=At(t.strm,t.window,t.strstart+t.lookahead,i),t.lookahead+=n,t.lookahead+t.insert>=3)for(s=t.strstart-t.insert,t.ins_h=t.window[s],t.ins_h=vt(t,t.ins_h,t.window[s+1]);t.insert&&(t.ins_h=vt(t,t.ins_h,t.window[s+3-1]),t.prev[s&t.w_mask]=t.head[t.ins_h],t.head[t.ins_h]=s,s++,t.insert--,!(t.lookahead+t.insert<3)););}while(t.lookahead<ft&&0!==t.strm.avail_in)},Rt=(t,e)=>{let a,n;for(;;){if(t.lookahead<ft){if(Zt(t),t.lookahead<ft&&e===W)return 1;if(0===t.lookahead)break}if(a=0,t.lookahead>=3&&(t.ins_h=vt(t,t.ins_h,t.window[t.strstart+3-1]),a=t.prev[t.strstart&t.w_mask]=t.head[t.ins_h],t.head[t.ins_h]=t.strstart),0!==a&&t.strstart-a<=t.w_size-ft&&(t.match_length=Et(t,a)),t.match_length>=3)if(n=G(t,t.strstart-t.match_start,t.match_length-3),t.lookahead-=t.match_length,t.match_length<=t.max_lazy_match&&t.lookahead>=3){t.match_length--;do{t.strstart++,t.ins_h=vt(t,t.ins_h,t.window[t.strstart+3-1]),a=t.prev[t.strstart&t.w_mask]=t.head[t.ins_h],t.head[t.ins_h]=t.strstart}while(0!=--t.match_length);t.strstart++}else t.strstart+=t.match_length,t.match_length=0,t.ins_h=t.window[t.strstart],t.ins_h=vt(t,t.ins_h,t.window[t.strstart+1]);else n=G(t,0,t.window[t.strstart]),t.lookahead--,t.strstart++;if(n&&(zt(t,!1),0===t.strm.avail_out))return 1}return t.insert=t.strstart<2?t.strstart:2,e===Q?(zt(t,!0),0===t.strm.avail_out?3:4):t.last_lit&&(zt(t,!1),0===t.strm.avail_out)?1:2},Ut=(t,e)=>{let a,n,r;for(;;){if(t.lookahead<ft){if(Zt(t),t.lookahead<ft&&e===W)return 1;if(0===t.lookahead)break}if(a=0,t.lookahead>=3&&(t.ins_h=vt(t,t.ins_h,t.window[t.strstart+3-1]),a=t.prev[t.strstart&t.w_mask]=t.head[t.ins_h],t.head[t.ins_h]=t.strstart),t.prev_length=t.match_length,t.prev_match=t.match_start,t.match_length=2,0!==a&&t.prev_length<t.max_lazy_match&&t.strstart-a<=t.w_size-ft&&(t.match_length=Et(t,a),t.match_length<=5&&(t.strategy===it||3===t.match_length&&t.strstart-t.match_start>4096)&&(t.match_length=2)),t.prev_length>=3&&t.match_length<=t.prev_length){r=t.strstart+t.lookahead-3,n=G(t,t.strstart-1-t.prev_match,t.prev_length-3),t.lookahead-=t.prev_length-1,t.prev_length-=2;do{++t.strstart<=r&&(t.ins_h=vt(t,t.ins_h,t.window[t.strstart+3-1]),a=t.prev[t.strstart&t.w_mask]=t.head[t.ins_h],t.head[t.ins_h]=t.strstart)}while(0!=--t.prev_length);if(t.match_available=0,t.match_length=2,t.strstart++,n&&(zt(t,!1),0===t.strm.avail_out))return 1}else if(t.match_available){if(n=G(t,0,t.window[t.strstart-1]),n&&zt(t,!1),t.strstart++,t.lookahead--,0===t.strm.avail_out)return 1}else t.match_available=1,t.strstart++,t.lookahead--}return t.match_available&&(n=G(t,0,t.window[t.strstart-1]),t.match_available=0),t.insert=t.strstart<2?t.strstart:2,e===Q?(zt(t,!0),0===t.strm.avail_out?3:4):t.last_lit&&(zt(t,!1),0===t.strm.avail_out)?1:2};function St(t,e,a,n,r){this.good_length=t,this.max_lazy=e,this.nice_length=a,this.max_chain=n,this.func=r}const Lt=[new St(0,0,0,0,((t,e)=>{let a=65535;for(a>t.pending_buf_size-5&&(a=t.pending_buf_size-5);;){if(t.lookahead<=1){if(Zt(t),0===t.lookahead&&e===W)return 1;if(0===t.lookahead)break}t.strstart+=t.lookahead,t.lookahead=0;const n=t.block_start+a;if((0===t.strstart||t.strstart>=n)&&(t.lookahead=t.strstart-n,t.strstart=n,zt(t,!1),0===t.strm.avail_out))return 1;if(t.strstart-t.block_start>=t.w_size-ft&&(zt(t,!1),0===t.strm.avail_out))return 1}return t.insert=0,e===Q?(zt(t,!0),0===t.strm.avail_out?3:4):(t.strstart>t.block_start&&(zt(t,!1),t.strm.avail_out),1)})),new St(4,4,8,4,Rt),new St(4,5,16,8,Rt),new St(4,6,32,32,Rt),new St(4,4,16,16,Ut),new St(8,16,32,32,Ut),new St(8,16,128,128,Ut),new St(8,32,128,256,Ut),new St(32,128,258,1024,Ut),new St(32,258,258,4096,Ut)];function Ft(){this.strm=null,this.status=0,this.pending_buf=null,this.pending_buf_size=0,this.pending_out=0,this.pending=0,this.wrap=0,this.gzhead=null,this.gzindex=0,this.method=dt,this.last_flush=-1,this.w_size=0,this.w_bits=0,this.w_mask=0,this.window=null,this.window_size=0,this.prev=null,this.head=null,this.ins_h=0,this.hash_size=0,this.hash_bits=0,this.hash_mask=0,this.hash_shift=0,this.block_start=0,this.match_length=0,this.prev_match=0,this.match_available=0,this.strstart=0,this.match_start=0,this.lookahead=0,this.prev_length=0,this.max_chain_length=0,this.max_lazy_match=0,this.level=0,this.strategy=0,this.good_match=0,this.nice_match=0,this.dyn_ltree=new Uint16Array(1146),this.dyn_dtree=new Uint16Array(122),this.bl_tree=new Uint16Array(78),mt(this.dyn_ltree),mt(this.dyn_dtree),mt(this.bl_tree),this.l_desc=null,this.d_desc=null,this.bl_desc=null,this.bl_count=new Uint16Array(16),this.heap=new Uint16Array(573),mt(this.heap),this.heap_len=0,this.heap_max=0,this.depth=new Uint16Array(573),mt(this.depth),this.l_buf=0,this.lit_bufsize=0,this.last_lit=0,this.d_buf=0,this.opt_len=0,this.static_len=0,this.matches=0,this.insert=0,this.bi_buf=0,this.bi_valid=0}const Ot=t=>{if(!t||!t.state)return wt(t,et);t.total_in=t.total_out=0,t.data_type=ot;const e=t.state;return e.pending=0,e.pending_out=0,e.wrap<0&&(e.wrap=-e.wrap),e.status=e.wrap?42:pt,t.adler=2===e.wrap?0:1,e.last_flush=W,j(e),$},Tt=t=>{const e=Ot(t);var a;return e===$&&((a=t.state).window_size=2*a.w_size,mt(a.head),a.max_lazy_match=Lt[a.level].max_lazy,a.good_match=Lt[a.level].good_length,a.nice_match=Lt[a.level].nice_length,a.max_chain_length=Lt[a.level].max_chain,a.strstart=0,a.block_start=0,a.lookahead=0,a.insert=0,a.match_length=a.prev_length=2,a.match_available=0,a.ins_h=0),e},Dt=(t,e,a,n,r,i)=>{if(!t)return et;let s=1;if(e===rt&&(e=6),n<0?(s=0,n=-n):n>15&&(s=2,n-=16),r<1||r>9||a!==dt||n<8||n>15||e<0||e>9||i<0||i>lt)return wt(t,et);8===n&&(n=9);const _=new Ft;return t.state=_,_.strm=t,_.wrap=s,_.gzhead=null,_.w_bits=n,_.w_size=1<<_.w_bits,_.w_mask=_.w_size-1,_.hash_bits=r+7,_.hash_size=1<<_.hash_bits,_.hash_mask=_.hash_size-1,_.hash_shift=~~((_.hash_bits+3-1)/3),_.window=new Uint8Array(2*_.w_size),_.head=new Uint16Array(_.hash_size),_.prev=new Uint16Array(_.w_size),_.lit_bufsize=1<<r+6,_.pending_buf_size=4*_.lit_bufsize,_.pending_buf=new Uint8Array(_.pending_buf_size),_.d_buf=1*_.lit_bufsize,_.l_buf=3*_.lit_bufsize,_.level=e,_.strategy=i,_.method=a,Tt(t)};var Nt={deflateInit:(t,e)=>Dt(t,e,dt,15,8,ht),deflateInit2:Dt,deflateReset:Tt,deflateResetKeep:Ot,deflateSetHeader:(t,e)=>t&&t.state?2!==t.state.wrap?et:(t.state.gzhead=e,$):et,deflate:(t,e)=>{let a,n;if(!t||!t.state||e>V||e<0)return t?wt(t,et):et;const r=t.state;if(!t.output||!t.input&&0!==t.avail_in||r.status===gt&&e!==Q)return wt(t,0===t.avail_out?nt:et);r.strm=t;const i=r.last_flush;if(r.last_flush=e,42===r.status)if(2===r.wrap)t.adler=0,kt(r,31),kt(r,139),kt(r,8),r.gzhead?(kt(r,(r.gzhead.text?1:0)+(r.gzhead.hcrc?2:0)+(r.gzhead.extra?4:0)+(r.gzhead.name?8:0)+(r.gzhead.comment?16:0)),kt(r,255&r.gzhead.time),kt(r,r.gzhead.time>>8&255),kt(r,r.gzhead.time>>16&255),kt(r,r.gzhead.time>>24&255),kt(r,9===r.level?2:r.strategy>=st||r.level<2?4:0),kt(r,255&r.gzhead.os),r.gzhead.extra&&r.gzhead.extra.length&&(kt(r,255&r.gzhead.extra.length),kt(r,r.gzhead.extra.length>>8&255)),r.gzhead.hcrc&&(t.adler=H(t.adler,r.pending_buf,r.pending,0)),r.gzindex=0,r.status=69):(kt(r,0),kt(r,0),kt(r,0),kt(r,0),kt(r,0),kt(r,9===r.level?2:r.strategy>=st||r.level<2?4:0),kt(r,3),r.status=pt);else{let e=dt+(r.w_bits-8<<4)<<8,a=-1;a=r.strategy>=st||r.level<2?0:r.level<6?1:6===r.level?2:3,e|=a<<6,0!==r.strstart&&(e|=32),e+=31-e%31,r.status=pt,xt(r,e),0!==r.strstart&&(xt(r,t.adler>>>16),xt(r,65535&t.adler)),t.adler=1}if(69===r.status)if(r.gzhead.extra){for(a=r.pending;r.gzindex<(65535&r.gzhead.extra.length)&&(r.pending!==r.pending_buf_size||(r.gzhead.hcrc&&r.pending>a&&(t.adler=H(t.adler,r.pending_buf,r.pending-a,a)),yt(t),a=r.pending,r.pending!==r.pending_buf_size));)kt(r,255&r.gzhead.extra[r.gzindex]),r.gzindex++;r.gzhead.hcrc&&r.pending>a&&(t.adler=H(t.adler,r.pending_buf,r.pending-a,a)),r.gzindex===r.gzhead.extra.length&&(r.gzindex=0,r.status=73)}else r.status=73;if(73===r.status)if(r.gzhead.name){a=r.pending;do{if(r.pending===r.pending_buf_size&&(r.gzhead.hcrc&&r.pending>a&&(t.adler=H(t.adler,r.pending_buf,r.pending-a,a)),yt(t),a=r.pending,r.pending===r.pending_buf_size)){n=1;break}n=r.gzindex<r.gzhead.name.length?255&r.gzhead.name.charCodeAt(r.gzindex++):0,kt(r,n)}while(0!==n);r.gzhead.hcrc&&r.pending>a&&(t.adler=H(t.adler,r.pending_buf,r.pending-a,a)),0===n&&(r.gzindex=0,r.status=91)}else r.status=91;if(91===r.status)if(r.gzhead.comment){a=r.pending;do{if(r.pending===r.pending_buf_size&&(r.gzhead.hcrc&&r.pending>a&&(t.adler=H(t.adler,r.pending_buf,r.pending-a,a)),yt(t),a=r.pending,r.pending===r.pending_buf_size)){n=1;break}n=r.gzindex<r.gzhead.comment.length?255&r.gzhead.comment.charCodeAt(r.gzindex++):0,kt(r,n)}while(0!==n);r.gzhead.hcrc&&r.pending>a&&(t.adler=H(t.adler,r.pending_buf,r.pending-a,a)),0===n&&(r.status=ct)}else r.status=ct;if(r.status===ct&&(r.gzhead.hcrc?(r.pending+2>r.pending_buf_size&&yt(t),r.pending+2<=r.pending_buf_size&&(kt(r,255&t.adler),kt(r,t.adler>>8&255),t.adler=0,r.status=pt)):r.status=pt),0!==r.pending){if(yt(t),0===t.avail_out)return r.last_flush=-1,$}else if(0===t.avail_in&&bt(e)<=bt(i)&&e!==Q)return wt(t,nt);if(r.status===gt&&0!==t.avail_in)return wt(t,nt);if(0!==t.avail_in||0!==r.lookahead||e!==W&&r.status!==gt){let a=r.strategy===st?((t,e)=>{let a;for(;;){if(0===t.lookahead&&(Zt(t),0===t.lookahead)){if(e===W)return 1;break}if(t.match_length=0,a=G(t,0,t.window[t.strstart]),t.lookahead--,t.strstart++,a&&(zt(t,!1),0===t.strm.avail_out))return 1}return t.insert=0,e===Q?(zt(t,!0),0===t.strm.avail_out?3:4):t.last_lit&&(zt(t,!1),0===t.strm.avail_out)?1:2})(r,e):r.strategy===_t?((t,e)=>{let a,n,r,i;const s=t.window;for(;;){if(t.lookahead<=ut){if(Zt(t),t.lookahead<=ut&&e===W)return 1;if(0===t.lookahead)break}if(t.match_length=0,t.lookahead>=3&&t.strstart>0&&(r=t.strstart-1,n=s[r],n===s[++r]&&n===s[++r]&&n===s[++r])){i=t.strstart+ut;do{}while(n===s[++r]&&n===s[++r]&&n===s[++r]&&n===s[++r]&&n===s[++r]&&n===s[++r]&&n===s[++r]&&n===s[++r]&&r<i);t.match_length=ut-(i-r),t.match_length>t.lookahead&&(t.match_length=t.lookahead)}if(t.match_length>=3?(a=G(t,1,t.match_length-3),t.lookahead-=t.match_length,t.strstart+=t.match_length,t.match_length=0):(a=G(t,0,t.window[t.strstart]),t.lookahead--,t.strstart++),a&&(zt(t,!1),0===t.strm.avail_out))return 1}return t.insert=0,e===Q?(zt(t,!0),0===t.strm.avail_out?3:4):t.last_lit&&(zt(t,!1),0===t.strm.avail_out)?1:2})(r,e):Lt[r.level].func(r,e);if(3!==a&&4!==a||(r.status=gt),1===a||3===a)return 0===t.avail_out&&(r.last_flush=-1),$;if(2===a&&(e===q?X(r):e!==V&&(K(r,0,0,!1),e===J&&(mt(r.head),0===r.lookahead&&(r.strstart=0,r.block_start=0,r.insert=0))),yt(t),0===t.avail_out))return r.last_flush=-1,$}return e!==Q?$:r.wrap<=0?tt:(2===r.wrap?(kt(r,255&t.adler),kt(r,t.adler>>8&255),kt(r,t.adler>>16&255),kt(r,t.adler>>24&255),kt(r,255&t.total_in),kt(r,t.total_in>>8&255),kt(r,t.total_in>>16&255),kt(r,t.total_in>>24&255)):(xt(r,t.adler>>>16),xt(r,65535&t.adler)),yt(t),r.wrap>0&&(r.wrap=-r.wrap),0!==r.pending?$:tt)},deflateEnd:t=>{if(!t||!t.state)return et;const e=t.state.status;return 42!==e&&69!==e&&73!==e&&91!==e&&e!==ct&&e!==pt&&e!==gt?wt(t,et):(t.state=null,e===pt?wt(t,at):$)},deflateSetDictionary:(t,e)=>{let a=e.length;if(!t||!t.state)return et;const n=t.state,r=n.wrap;if(2===r||1===r&&42!==n.status||n.lookahead)return et;if(1===r&&(t.adler=C(t.adler,e,a,0)),n.wrap=0,a>=n.w_size){0===r&&(mt(n.head),n.strstart=0,n.block_start=0,n.insert=0);let t=new Uint8Array(n.w_size);t.set(e.subarray(a-n.w_size,a),0),e=t,a=n.w_size}const i=t.avail_in,s=t.next_in,_=t.input;for(t.avail_in=a,t.next_in=0,t.input=e,Zt(n);n.lookahead>=3;){let t=n.strstart,e=n.lookahead-2;do{n.ins_h=vt(n,n.ins_h,n.window[t+3-1]),n.prev[t&n.w_mask]=n.head[n.ins_h],n.head[n.ins_h]=t,t++}while(--e);n.strstart=t,n.lookahead=2,Zt(n)}return n.strstart+=n.lookahead,n.block_start=n.strstart,n.insert=n.lookahead,n.lookahead=0,n.match_length=n.prev_length=2,n.match_available=0,t.next_in=s,t.input=_,t.avail_in=i,n.wrap=r,$},deflateInfo:"pako deflate (from Nodeca project)"};const It=(t,e)=>Object.prototype.hasOwnProperty.call(t,e);var Ct=function(t){const e=Array.prototype.slice.call(arguments,1);for(;e.length;){const a=e.shift();if(a){if("object"!=typeof a)throw new TypeError(a+"must be non-object");for(const e in a)It(a,e)&&(t[e]=a[e])}}return t},Bt=t=>{let e=0;for(let a=0,n=t.length;a<n;a++)e+=t[a].length;const a=new Uint8Array(e);for(let e=0,n=0,r=t.length;e<r;e++){let r=t[e];a.set(r,n),n+=r.length}return a};let Ht=!0;try{String.fromCharCode.apply(null,new Uint8Array(1))}catch(t){Ht=!1}const Mt=new Uint8Array(256);for(let t=0;t<256;t++)Mt[t]=t>=252?6:t>=248?5:t>=240?4:t>=224?3:t>=192?2:1;Mt[254]=Mt[254]=1;var Pt=t=>{let e,a,n,r,i,s=t.length,_=0;for(r=0;r<s;r++)a=t.charCodeAt(r),55296==(64512&a)&&r+1<s&&(n=t.charCodeAt(r+1),56320==(64512&n)&&(a=65536+(a-55296<<10)+(n-56320),r++)),_+=a<128?1:a<2048?2:a<65536?3:4;for(e=new Uint8Array(_),i=0,r=0;i<_;r++)a=t.charCodeAt(r),55296==(64512&a)&&r+1<s&&(n=t.charCodeAt(r+1),56320==(64512&n)&&(a=65536+(a-55296<<10)+(n-56320),r++)),a<128?e[i++]=a:a<2048?(e[i++]=192|a>>>6,e[i++]=128|63&a):a<65536?(e[i++]=224|a>>>12,e[i++]=128|a>>>6&63,e[i++]=128|63&a):(e[i++]=240|a>>>18,e[i++]=128|a>>>12&63,e[i++]=128|a>>>6&63,e[i++]=128|63&a);return e};var jt=function(){this.input=null,this.next_in=0,this.avail_in=0,this.total_in=0,this.output=null,this.next_out=0,this.avail_out=0,this.total_out=0,this.msg="",this.state=null,this.data_type=2,this.adler=0};const Kt=Object.prototype.toString,{Z_NO_FLUSH:Yt,Z_SYNC_FLUSH:Gt,Z_FULL_FLUSH:Xt,Z_FINISH:Wt,Z_OK:qt,Z_STREAM_END:Jt,Z_DEFAULT_COMPRESSION:Qt,Z_DEFAULT_STRATEGY:Vt,Z_DEFLATED:$t}=P;function te(t){this.options=Ct({level:Qt,method:$t,chunkSize:16384,windowBits:15,memLevel:8,strategy:Vt},t||{});let e=this.options;e.raw&&e.windowBits>0?e.windowBits=-e.windowBits:e.gzip&&e.windowBits>0&&e.windowBits<16&&(e.windowBits+=16),this.err=0,this.msg="",this.ended=!1,this.chunks=[],this.strm=new jt,this.strm.avail_out=0;let a=Nt.deflateInit2(this.strm,e.level,e.method,e.windowBits,e.memLevel,e.strategy);if(a!==qt)throw new Error(M[a]);if(e.header&&Nt.deflateSetHeader(this.strm,e.header),e.dictionary){let t;if(t="string"==typeof e.dictionary?Pt(e.dictionary):"[object ArrayBuffer]"===Kt.call(e.dictionary)?new Uint8Array(e.dictionary):e.dictionary,a=Nt.deflateSetDictionary(this.strm,t),a!==qt)throw new Error(M[a]);this._dict_set=!0}}function ee(t,e){const a=new te(e);if(a.push(t,!0),a.err)throw a.msg||M[a.err];return a.result}te.prototype.push=function(t,e){const a=this.strm,n=this.options.chunkSize;let r,i;if(this.ended)return!1;for(i=e===~~e?e:!0===e?Wt:Yt,"string"==typeof t?a.input=Pt(t):"[object ArrayBuffer]"===Kt.call(t)?a.input=new Uint8Array(t):a.input=t,a.next_in=0,a.avail_in=a.input.length;;)if(0===a.avail_out&&(a.output=new Uint8Array(n),a.next_out=0,a.avail_out=n),(i===Gt||i===Xt)&&a.avail_out<=6)this.onData(a.output.subarray(0,a.next_out)),a.avail_out=0;else{if(r=Nt.deflate(a,i),r===Jt)return a.next_out>0&&this.onData(a.output.subarray(0,a.next_out)),r=Nt.deflateEnd(this.strm),this.onEnd(r),this.ended=!0,r===qt;if(0!==a.avail_out){if(i>0&&a.next_out>0)this.onData(a.output.subarray(0,a.next_out)),a.avail_out=0;else if(0===a.avail_in)break}else this.onData(a.output)}return!0},te.prototype.onData=function(t){this.chunks.push(t)},te.prototype.onEnd=function(t){t===qt&&(this.result=Bt(this.chunks)),this.chunks=[],this.err=t,this.msg=this.strm.msg};var ae=te,ne=ee,re=function(t,e){return(e=e||{}).raw=!0,ee(t,e)},ie=function(t,e){return(e=e||{}).gzip=!0,ee(t,e)},se=P,_e={Deflate:ae,deflate:ne,deflateRaw:re,gzip:ie,constants:se};t.Deflate=ae,t.constants=se,t.default=_e,t.deflate=ne,t.deflateRaw=re,t.gzip=ie,Object.defineProperty(t,"__esModule",{value:!0})}));
+
+</script>
+<script>
+/* QR transfer protocol v2 — shared by sender.html and receiver.html.
+ *
+ * Frame bytes (big endian), then base45 (RFC 9285) so the QR can use
+ * alphanumeric mode (~97% efficient vs ~50% for the v1 latin1/UTF-8/base64 path):
+ *   0      ver/type   0x21 data, 0x22 repair, 0x23 meta
+ *   1..4   session    random per transfer
+ *   5..8   total      length of the transmitted byte stream (gzip or raw)
+ *   9..10  chunk      bytes per block
+ *   11..14 id         data: block index; repair: seed; meta: 0
+ *   15..   payload    data/repair: exactly `chunk` bytes (last block zero padded)
+ *                     meta: UTF-8 JSON {n:name, s:size, c:crc32(original), z:gzip?1:0}
+ *
+ * Repair frames are XORs of a pseudo-random half of all blocks (seeded), i.e. a
+ * systematic random linear fountain code over GF(2): a receiver that missed m
+ * blocks needs ~m+2 repair frames, regardless of which ones it missed.
+ */
+var QRT = (function () {
+  "use strict";
+  var VER = 0x20, T_DATA = 1, T_REPAIR = 2, T_META = 3, HDR = 15;
+
+  // ---------- base45 ----------
+  var A45 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+  var R45 = new Int8Array(128).fill(-1);
+  for (var i = 0; i < 45; i++) R45[A45.charCodeAt(i)] = i;
+
+  function b45enc(b) {
+    var out = [], n = b.length, i = 0;
+    for (; i + 1 < n; i += 2) {
+      var x = b[i] * 256 + b[i + 1];
+      out.push(A45[x % 45], A45[((x / 45) | 0) % 45], A45[(x / 2025) | 0]);
+    }
+    if (i < n) { out.push(A45[b[i] % 45], A45[(b[i] / 45) | 0]); }
+    return out.join("");
+  }
+  function b45dec(s) {
+    var n = s.length;
+    if (n % 3 === 1) throw new Error("b45 length");
+    var out = new Uint8Array(Math.floor(n / 3) * 2 + (n % 3 === 2 ? 1 : 0)), o = 0;
+    for (var i = 0; i < n; i += 3) {
+      var c0 = s.charCodeAt(i), c1 = s.charCodeAt(i + 1);
+      var a = c0 < 128 ? R45[c0] : -1, b = c1 < 128 ? R45[c1] : -1;
+      if (a < 0 || b < 0) throw new Error("b45 char");
+      if (i + 2 < n) {
+        var c2 = s.charCodeAt(i + 2), c = c2 < 128 ? R45[c2] : -1;
+        if (c < 0) throw new Error("b45 char");
+        var x = a + b * 45 + c * 2025;
+        if (x > 65535) throw new Error("b45 range");
+        out[o++] = x >> 8; out[o++] = x & 255;
+      } else {
+        var y = a + b * 45;
+        if (y > 255) throw new Error("b45 range");
+        out[o++] = y;
+      }
+    }
+    return out;
+  }
+
+  // ---------- CRC32 ----------
+  var CRC = (function () {
+    var t = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+  })();
+  function crc32(b) {
+    var c = 0xffffffff;
+    for (var i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  // ---------- repair masks ----------
+  // Bitset (Uint32Array, LSB = lowest block) of the blocks XORed into repair `seed`.
+  function repairMask(seed, K) {
+    var W = (K + 31) >>> 5, m = new Uint32Array(W);
+    // mulberry32: must be non-linear over GF(2) (xorshift is linear and would
+    // confine all masks to a 32-dimensional subspace).
+    var s = (Math.imul(seed >>> 0, 0x9e3779b1) ^ Math.imul(K, 0x85ebca6b)) >>> 0;
+    function next() {
+      s = (s + 0x6d2b79f5) >>> 0;
+      var t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return (t ^ (t >>> 14)) >>> 0;
+    }
+    var w;
+    for (w = 0; w < W; w++) m[w] = next();
+    var rem = K & 31;
+    if (rem) m[W - 1] &= (1 << rem) - 1;
+    var any = 0; for (w = 0; w < W; w++) any |= m[w];
+    if (!any) m[(seed % K) >>> 5] |= 1 << ((seed % K) & 31);
+    return m;
+  }
+
+  function xorInto(dst, src) { for (var i = 0; i < dst.length; i++) dst[i] ^= src[i]; }
+
+  // ---------- frames ----------
+  function header(type, session, total, chunk, id, payloadLen) {
+    var f = new Uint8Array(HDR + payloadLen), v = new DataView(f.buffer);
+    f[0] = VER | type; v.setUint32(1, session); v.setUint32(5, total); v.setUint16(9, chunk); v.setUint32(11, id >>> 0);
+    return f;
+  }
+  function parse(text) {
+    var b = b45dec(text);
+    if (b.length < HDR || (b[0] & 0xf0) !== VER) throw new Error("not a v2 frame");
+    var v = new DataView(b.buffer), type = b[0] & 15;
+    var f = { type: type, session: v.getUint32(1), total: v.getUint32(5), chunk: v.getUint16(9), id: v.getUint32(11), payload: b.subarray(HDR) };
+    if (!f.chunk || type < 1 || type > 3) throw new Error("bad header");
+    if (type !== T_META && f.payload.length !== f.chunk) throw new Error("bad payload length");
+    if (type === T_DATA && f.id >= Math.ceil(f.total / f.chunk)) throw new Error("bad index");
+    if (type === T_META) f.meta = JSON.parse(new TextDecoder().decode(f.payload));
+    return f;
+  }
+
+  // Sender side: holds the stream, produces frame texts.
+  function Encoder(stream, chunk, meta) {
+    this.stream = stream; this.chunk = chunk; this.total = stream.length;
+    this.K = Math.max(1, Math.ceil(stream.length / chunk));
+    this.session = (crypto.getRandomValues(new Uint32Array(1))[0]) >>> 0;
+    this.meta = meta;
+    this.blocks = [];
+    for (var i = 0; i < this.K; i++) {
+      var blk = new Uint8Array(chunk);
+      blk.set(stream.subarray(i * chunk, (i + 1) * chunk));
+      this.blocks.push(blk);
+    }
+  }
+  Encoder.prototype.metaFrame = function () {
+    var p = new TextEncoder().encode(JSON.stringify(this.meta));
+    var f = header(T_META, this.session, this.total, this.chunk, 0, p.length);
+    f.set(p, HDR); return b45enc(f);
+  };
+  Encoder.prototype.dataFrame = function (i) {
+    var f = header(T_DATA, this.session, this.total, this.chunk, i, this.chunk);
+    f.set(this.blocks[i], HDR); return b45enc(f);
+  };
+  Encoder.prototype.repairFrame = function (seed) {
+    var f = header(T_REPAIR, this.session, this.total, this.chunk, seed, this.chunk);
+    var p = f.subarray(HDR), m = repairMask(seed, this.K);
+    for (var w = 0; w < m.length; w++) {
+      var x = m[w];
+      while (x) { var t = x & -x, b = (w << 5) + (31 - Math.clz32(t)); xorInto(p, this.blocks[b]); x ^= t; }
+    }
+    return b45enc(f);
+  };
+
+  // Receiver side: incremental GF(2) elimination over the still-unknown blocks.
+  function Decoder(session, total, chunk) {
+    this.session = session; this.total = total; this.chunk = chunk;
+    this.K = Math.max(1, Math.ceil(total / chunk)); this.W = (this.K + 31) >>> 5;
+    this.blocks = new Array(this.K);              // Uint8Array once known
+    this.state = new Uint8Array(this.K);          // 0 unknown, 1 received, 2 recovered
+    this.known = 0; this.rows = new Map();        // pivot -> {m, d}
+    this.maxIndex = -1; this.repairs = 0; this.meta = null;
+  }
+  Decoder.prototype.done = function () { return this.known === this.K; };
+  Decoder.prototype.needed = function () { return Math.max(0, this.K - this.known - this.rows.size); };
+  Decoder.prototype._learn = function (i, data, how) {
+    if (this.state[i]) return false;
+    this.blocks[i] = data; this.state[i] = how; this.known++;
+    var r = this.rows.get(i);                      // an equation pivoted on i is now redundant info: re-reduce it
+    if (r) { this.rows.delete(i); r.m[i >>> 5] &= ~(1 << (i & 31)); xorInto(r.d, data); this._insert(r.m, r.d); }
+    return true;
+  };
+  // Reduce an equation (mask m, data d) against known blocks and stored rows; store it or solve.
+  Decoder.prototype._insert = function (m, d) {
+    for (var w = 0; w < this.W; w++) {
+      var x;
+      while ((x = m[w])) {
+        var t = x & -x, b = (w << 5) + (31 - Math.clz32(t));
+        if (this.state[b]) { xorInto(d, this.blocks[b]); m[w] ^= t; continue; }
+        var r = this.rows.get(b);
+        if (r) { for (var k = w; k < this.W; k++) m[k] ^= r.m[k]; xorInto(d, r.d); continue; }
+        // new pivot b: if it's the only remaining bit, solved directly
+        var single = (m[w] ^ t) === 0;
+        for (var k2 = w + 1; single && k2 < this.W; k2++) if (m[k2]) single = false;
+        if (single) this._learn(b, d, 2); else this.rows.set(b, { m: m, d: d });
+        return;
+      }
+    }
+  };
+  Decoder.prototype._solve = function () {
+    if (this.done() || this.rows.size !== this.K - this.known) return;
+    var pivots = Array.from(this.rows.keys()).sort(function (a, b) { return b - a; });
+    for (var j = 0; j < pivots.length; j++) {
+      var p = pivots[j], r = this.rows.get(p);
+      if (!r) continue;
+      this.rows.delete(p);
+      r.m[p >>> 5] &= ~(1 << (p & 31));
+      for (var w = 0; w < this.W; w++) {
+        var x = r.m[w];
+        while (x) { var t = x & -x, b = (w << 5) + (31 - Math.clz32(t)); xorInto(r.d, this.blocks[b]); x ^= t; }
+      }
+      this._learn(p, r.d, 2);
+    }
+  };
+  // Returns true if the frame added information.
+  Decoder.prototype.add = function (f) {
+    if (f.type === T_META) { var had = !!this.meta; this.meta = f.meta; return !had; }
+    if (f.type === T_DATA) {
+      if (f.id > this.maxIndex) this.maxIndex = f.id;
+      var added = this._learn(f.id, new Uint8Array(f.payload), 1);
+      if (added) this._solve();
+      return added;
+    }
+    this.repairs++;
+    if (this.done()) return false;
+    var before = this.known + this.rows.size;
+    this._insert(repairMask(f.id, this.K), new Uint8Array(f.payload));
+    this._solve();
+    return this.known + this.rows.size > before;
+  };
+  Decoder.prototype.assemble = function () {
+    var out = new Uint8Array(this.K * this.chunk);
+    for (var i = 0; i < this.K; i++) out.set(this.blocks[i], i * this.chunk);
+    return out.subarray(0, this.total);
+  };
+  Decoder.prototype.missing = function (all) {
+    var lim = all ? this.K - 1 : this.maxIndex, out = [];
+    for (var i = 0; i <= lim; i++) if (!this.state[i]) out.push(i);
+    return out;
+  };
+
+  // ---------- "12,45-48,97" ranges ----------
+  function formatRanges(list) {
+    var out = [], i = 0;
+    while (i < list.length) {
+      var a = list[i], b = a;
+      while (i + 1 < list.length && list[i + 1] === b + 1) b = list[++i];
+      out.push(a === b ? String(a) : a + "-" + b); i++;
+    }
+    return out.join(",");
+  }
+  function parseRanges(s, K) {
+    var set = new Set();
+    String(s).split(/[\s,;]+/).forEach(function (p) {
+      if (!p) return;
+      var m = /^(\d+)(?:-(\d+))?$/.exec(p);
+      if (!m) throw new Error("can't parse '" + p + "'");
+      var a = +m[1], b = m[2] === undefined ? a : +m[2];
+      if (a > b) { var t = a; a = b; b = t; }
+      for (var i = a; i <= b && i < K; i++) set.add(i);
+    });
+    return Array.from(set).sort(function (x, y) { return x - y; });
+  }
+
+  return {
+    HDR: HDR, T_DATA: T_DATA, T_REPAIR: T_REPAIR, T_META: T_META,
+    b45enc: b45enc, b45dec: b45dec, crc32: crc32, repairMask: repairMask,
+    parse: parse, Encoder: Encoder, Decoder: Decoder,
+    formatRanges: formatRanges, parseRanges: parseRanges
+  };
+})();
+if (typeof module !== "undefined") module.exports = QRT;
+
+</script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var QR = qrcodegen.QrCode, SEG = qrcodegen.QrSegment;
+
+  var S = null;      // running session state
+  var wakeLock = null;
+
+  function fmtBytes(n) { return n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(2) + " MB"; }
+  function fmtTime(s) { s = Math.round(s); return s < 60 ? s + " s" : s < 3600 ? Math.floor(s / 60) + " min " + (s % 60) + " s" : (s / 3600).toFixed(1) + " h"; }
+
+  // ---------- rendering ----------
+  function layout(n) {
+    var st = $("stage"), r = st.getBoundingClientRect();
+    var cols = n === 1 ? 1 : n === 2 ? (r.width >= r.height ? 2 : 1) : 2;
+    var rows = Math.ceil(n / cols);
+    var side = Math.floor(Math.min(r.width / cols, r.height / rows));
+    st.innerHTML = "";
+    st.style.gridTemplateColumns = "repeat(" + cols + ", auto)";
+    var canvases = [];
+    for (var i = 0; i < n; i++) {
+      var c = document.createElement("canvas");
+      st.appendChild(c); canvases.push(c);
+    }
+    return { canvases: canvases, side: side };
+  }
+  function draw(canvas, side, text, ecc) {
+    var qr = QR.encodeSegments([SEG.makeAlphanumeric(text)], ecc, 1, 40, -1, false);
+    var dpr = window.devicePixelRatio || 1, px = Math.floor(side * dpr);
+    var total = qr.size + 8;                          // 4-module quiet zone each side
+    var mod = Math.max(1, Math.floor(px / total));    // integer pixels per module = crisp edges
+    var dim = mod * total;
+    if (canvas.width !== dim) { canvas.width = canvas.height = dim; }
+    canvas.style.width = canvas.style.height = (dim / dpr) + "px";
+    var ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, dim, dim);
+    ctx.fillStyle = "#000";
+    for (var y = 0; y < qr.size; y++) {
+      var run = -1;
+      for (var x = 0; x <= qr.size; x++) {
+        var dark = x < qr.size && qr.getModule(x, y);
+        if (dark && run < 0) run = x;
+        else if (!dark && run >= 0) { ctx.fillRect((run + 4) * mod, (y + 4) * mod, (x - run) * mod, mod); run = -1; }
+      }
+    }
+    return qr.version;
+  }
+  function idleScreen() {
+    var L = layout(1);
+    draw(L.canvases[0], Math.min(L.side, 320), "QR SENDER V2 - READY", qrcodegen.QrCode.Ecc.MEDIUM);
+  }
+
+  // ---------- frame sequence ----------
+  // header (meta) -> data 0..K-1 -> repair codes forever; meta interleaved every 20 frames.
+  // Or, with a resend list, cycle just those data blocks.
+  function nextText() {
+    S.count++;
+    if (S.count % 20 === 0) return { t: S.enc.metaFrame(), kind: "meta" };
+    if (S.resend) {
+      var i = S.resend[S.rpos++ % S.resend.length];
+      return { t: S.enc.dataFrame(i), kind: "resend", i: i };
+    }
+    if (S.pos < S.enc.K) { var j = S.pos++; return { t: S.enc.dataFrame(j), kind: "data", i: j }; }
+    return { t: S.enc.repairFrame(++S.seed), kind: "repair" };
+  }
+
+  function showFrame() {
+    var last, ver = 0;
+    for (var k = 0; k < S.L.canvases.length; k++) {
+      var f = S.headerUntil > performance.now() ? { t: S.metaText, kind: "meta" } : nextText();
+      ver = Math.max(ver, draw(S.L.canvases[k], S.L.side, f.t, S.ecc));
+      if (f.kind !== "meta") last = f;
+    }
+    S.version = ver;
+    updateStatus(last);
+  }
+
+  function updateStatus(f) {
+    var e = S.enc, perFrame = S.L.canvases.length;
+    var phase;
+    if (S.paused) phase = "Paused";
+    else if (S.headerUntil > performance.now()) phase = "Header — receiver should show the file name";
+    else if (S.resend) phase = "Resending " + S.resend.length + " block" + (S.resend.length > 1 ? "s" : "") + " (pass " + (Math.floor(S.rpos / S.resend.length) + 1) + ")";
+    else if (S.pos < e.K) phase = "Pass 1 · block " + (f && f.kind === "data" ? f.i + 1 : S.pos) + "/" + e.K;
+    else phase = "Repair codes · " + S.seed + " sent — keep going until the receiver says complete";
+    $("msg").textContent = phase;
+    $("prog").max = e.K; $("prog").value = Math.min(S.pos, e.K);
+    $("meta").textContent = S.info + " · QR v" + S.version + " · pass ≈ " + fmtTime(Math.ceil(e.K / perFrame) * S.delay / 1000);
+  }
+
+  function loop(now) {
+    if (!S || !S.running) return;
+    if (!S.paused && now >= S.nextAt) {
+      try { showFrame(); }
+      catch (err) { $("msg").innerHTML = '<span class="err"></span>'; $("msg").firstChild.textContent = "Error: " + err.message + " — try a smaller chunk or ECC L"; stop(true); return; }
+      S.nextAt = (now - S.nextAt > S.delay) ? now + S.delay : S.nextAt + S.delay;
+    }
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- controls ----------
+  function setRunning(on) {
+    $("start").disabled = on; $("stop").disabled = !on; $("pause").disabled = !on;
+    $("applyResend").disabled = !on; $("clearResend").disabled = !on;
+    ["file", "delay", "ncodes", "chunk", "ecc", "hdr"].forEach(function (id) { $(id).disabled = on; });
+    $("prog").hidden = !on;
+  }
+
+  async function start() {
+    var file = $("file").files[0];
+    if (!file) { $("msg").textContent = "Choose a file first."; return; }
+    var chunk = Math.min(+$("chunk").max, Math.max(50, Math.round(+$("chunk").value) || 400));
+    var delay = Math.max(50, +$("delay").value || 150);
+    var n = +$("ncodes").value || 1;
+    setRunning(true);
+    $("msg").textContent = "Reading and compressing " + fmtBytes(file.size) + "…";
+    await new Promise(function (r) { setTimeout(r, 30); });
+    var raw, stream, gz = 0;
+    try {
+      raw = new Uint8Array(await file.arrayBuffer());
+      var z = pako.gzip(raw, { level: 9 });
+      if (z.length < raw.length) { stream = z; gz = 1; } else stream = raw;
+    } catch (e) { $("msg").textContent = "Could not read/compress: " + e; setRunning(false); return; }
+    var enc = new QRT.Encoder(stream, chunk, { n: file.name, s: raw.length, c: QRT.crc32(raw), z: gz });
+    S = {
+      enc: enc, delay: delay, ecc: QR.Ecc[$("ecc").value], running: true, paused: false,
+      pos: 0, seed: 0, count: 0, resend: null, rpos: 0, version: 0,
+      metaText: enc.metaFrame(), L: layout(n),
+      headerUntil: performance.now() + Math.max(0, +$("hdr").value || 0) * 1000,
+      info: file.name + " · " + fmtBytes(raw.length) + (gz ? " → " + fmtBytes(stream.length) + " gzip" : " (not compressible)") + " · " + enc.K + " blocks (0–" + (enc.K - 1) + ")",
+    };
+    S.nextAt = performance.now();
+    applyResend(true);
+    try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+    requestAnimationFrame(loop);
+  }
+
+  function stop(keepMsg) {
+    if (S) S.running = false;
+    S = null; setRunning(false);
+    if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
+    if (keepMsg !== true) { $("msg").textContent = "Stopped."; $("meta").textContent = ""; }
+    idleScreen();
+  }
+
+  function applyResend(silent) {
+    if (!S) return;
+    var txt = $("resend").value.trim();
+    if (!txt) { S.resend = null; return; }
+    try {
+      var list = QRT.parseRanges(txt, S.enc.K);
+      if (!list.length) throw new Error("no valid block numbers (0–" + (S.enc.K - 1) + ")");
+      S.resend = list; S.rpos = 0;
+    } catch (e) { if (!silent) alert("Resend list: " + e.message); }
+  }
+
+  $("start").addEventListener("click", start);
+  $("stop").addEventListener("click", function () { stop(); });
+  $("pause").addEventListener("click", function () {
+    if (!S) return; S.paused = !S.paused; $("pause").textContent = S.paused ? "Resume" : "Pause";
+    if (!S.paused) S.nextAt = performance.now();
+    updateStatus();
+  });
+  $("applyResend").addEventListener("click", function () { applyResend(false); });
+  $("resend").addEventListener("keydown", function (e) { if (e.key === "Enter") applyResend(false); });
+  $("clearResend").addEventListener("click", function () { $("resend").value = ""; if (S) S.resend = null; });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && S) stop();
+    if (e.key === " " && S && document.activeElement.tagName !== "INPUT") { e.preventDefault(); $("pause").click(); }
+  });
+  document.addEventListener("visibilitychange", async function () {
+    if (S && document.visibilityState === "visible" && navigator.wakeLock) { try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {} }
+  });
+
+  var wrap = $("wrap");
+  wrap.addEventListener("dragover", function (e) { e.preventDefault(); wrap.classList.add("drop"); });
+  wrap.addEventListener("dragleave", function () { wrap.classList.remove("drop"); });
+  wrap.addEventListener("drop", function (e) {
+    e.preventDefault(); wrap.classList.remove("drop");
+    if (!S && e.dataTransfer.files.length) $("file").files = e.dataTransfer.files;
+  });
+  var rt; window.addEventListener("resize", function () {
+    clearTimeout(rt); rt = setTimeout(function () { if (S) S.L = layout(S.L.canvases.length); else idleScreen(); }, 150);
+  });
+  idleScreen();
+})();
+</script>
+</body>
+</html>
